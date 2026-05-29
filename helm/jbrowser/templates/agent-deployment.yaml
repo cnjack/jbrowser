@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-agent
+spec:
+  replicas: {{ .Values.agent.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-agent
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-agent
+    spec:
+      containers:
+        - name: agent
+          image: {{ .Values.image.agent }}
+          env:
+            - name: CONTROL_PLANE_HTTP_URL
+              value: http://{{ .Release.Name }}-control
+            - name: CONTROL_PLANE_WS_URL
+              value: ws://{{ .Release.Name }}-control
+            - name: REGISTRATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.jwtSecretName }}
+                  key: {{ .Values.agent.registrationTokenSecretKey }}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.agent.shmSize }}
+

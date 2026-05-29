@@ -1,0 +1,23 @@
+FROM rust:1.89-bookworm AS rust-builder
+WORKDIR /app
+COPY Cargo.toml ./
+COPY crates ./crates
+RUN cargo build --release -p jbrowser-control-plane
+
+FROM node:22-bookworm AS frontend-builder
+WORKDIR /app
+COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY frontend/package.json ./frontend/
+RUN corepack enable && pnpm install --frozen-lockfile=false --filter ./frontend
+COPY frontend ./frontend
+RUN pnpm --filter ./frontend build
+
+FROM debian:bookworm-slim
+RUN useradd -m -u 10001 jbrowser
+WORKDIR /opt/jbrowser
+COPY --from=rust-builder /app/target/release/jbrowser-control-plane /usr/local/bin/jbrowser-control-plane
+COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+USER jbrowser
+EXPOSE 8080
+CMD ["jbrowser-control-plane"]
+

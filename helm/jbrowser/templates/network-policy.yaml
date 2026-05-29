@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-agent-egress-only
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Release.Name }}-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: {{ .Release.Name }}-control
+      ports:
+        - protocol: TCP
+          port: 80
+

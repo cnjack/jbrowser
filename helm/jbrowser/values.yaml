@@ -1,0 +1,21 @@
+image:
+  control: jbrowser-control:latest
+  agent: jbrowser-agent-chromium:latest
+
+control:
+  replicas: 1
+  port: 8080
+  publicBaseUrl: https://jbrowser.example.com
+  jwtSecretName: jbrowser-secrets
+  databaseUrlSecretKey: database-url
+  jwtSecretKey: jwt-secret
+
+agent:
+  replicas: 1
+  registrationTokenSecretKey: agent-registration-token
+  shmSize: 1Gi
+
+ingress:
+  enabled: false
+  host: jbrowser.example.com
+

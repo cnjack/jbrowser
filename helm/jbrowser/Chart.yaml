@@ -1,0 +1,7 @@
+apiVersion: v2
+name: jbrowser
+description: Self-hosted remote browser control platform MVP
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+

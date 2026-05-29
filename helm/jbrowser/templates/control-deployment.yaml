@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-control
+spec:
+  replicas: {{ .Values.control.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-control
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-control
+    spec:
+      containers:
+        - name: control
+          image: {{ .Values.image.control }}
+          ports:
+            - containerPort: {{ .Values.control.port }}
+          env:
+            - name: PORT
+              value: "{{ .Values.control.port }}"
+            - name: PUBLIC_BASE_URL
+              value: {{ .Values.control.publicBaseUrl | quote }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.jwtSecretName }}
+                  key: {{ .Values.control.databaseUrlSecretKey }}
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.jwtSecretName }}
+                  key: {{ .Values.control.jwtSecretKey }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.control.port }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.control.port }}
+

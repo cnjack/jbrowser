@@ -1,0 +1,55 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: jbrowser
+      MYSQL_DATABASE: jbrowser
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pjbrowser"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  control:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.control
+    environment:
+      JWT_SECRET: dev-secret-change-me
+      DATABASE_URL: mysql://root:jbrowser@mysql:3306/jbrowser
+      PUBLIC_BASE_URL: http://localhost:8080
+      DEMO_EMAIL: admin@example.com
+      DEMO_PASSWORD: jbrowser
+      SEED_AGENT_TOKEN: jbr_reg_dev_seed_token_for_local_docker
+      RUST_LOG: info,jbrowser_control_plane=debug
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  agent-chromium:
+    profiles: ["agent"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent-chromium
+    environment:
+      CONTROL_PLANE_HTTP_URL: http://control:8080
+      CONTROL_PLANE_WS_URL: ws://control:8080
+      REGISTRATION_TOKEN: jbr_reg_dev_seed_token_for_local_docker
+      AGENT_NAME: chromium-agent
+      RUST_LOG: info,jbrowser_agent=debug
+    volumes:
+      - agent_data:/home/jbrowser/.local/share/jbrowser-agent
+    shm_size: "1gb"
+    depends_on:
+      - control
+
+volumes:
+  mysql_data:
+  agent_data:
+

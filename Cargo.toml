@@ -1,0 +1,13 @@
+[workspace]
+members = [
+  "crates/shared",
+  "crates/control-plane",
+  "crates/agent",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cnjack/jbrowser"
+
