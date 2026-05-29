@@ -23,20 +23,51 @@ export function Login() {
 
   return (
     <main className="auth-shell">
-      <form className="card login-card" onSubmit={handleSubmit}>
-        <p className="eyebrow">Remote Browser Control</p>
-        <h1>Sign in to JBrowser</h1>
-        <label>
-          Email
-          <input value={email} onChange={(event) => setEmail(event.target.value)} />
-        </label>
-        <label>
-          Password
-          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-        </label>
-        {error ? <p className="error">{error}</p> : null}
-        <button type="submit">Sign in</button>
-      </form>
+      <section className="auth-left">
+        <div className="brand">
+          <span className="brand-mark" />
+          <span className="brand-name">JBrowser</span>
+        </div>
+        <h1 className="auth-hero">
+          Fleet your <em>browsers</em> at scale.
+        </h1>
+        <ul className="auth-features">
+          <li>Headless Chromium on demand</li>
+          <li>CDP access in milliseconds</li>
+          <li>Multi-tenant, audit-logged</li>
+        </ul>
+        <div className="auth-stamp">v1.0 · remote browser control</div>
+      </section>
+
+      <section className="auth-right">
+        <form className="login-card" onSubmit={handleSubmit}>
+          <p className="eyebrow">Welcome back</p>
+          <h2>Sign in</h2>
+          <p>Enter your credentials to access the control plane.</p>
+          {error ? <div className="error-msg">{error}</div> : null}
+          <div className="field">
+            <label htmlFor="email">Email</label>
+            <input
+              id="email"
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              placeholder="you@company.com"
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="password">Password</label>
+            <input
+              id="password"
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder="Enter password"
+            />
+          </div>
+          <button type="submit" className="btn-primary">Sign in</button>
+        </form>
+      </section>
     </main>
   );
 }

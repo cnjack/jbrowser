@@ -147,7 +147,7 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
           />
           <button type="submit" className="address-go">Go</button>
         </form>
-        <div className="divider" />
+        <div className="divider-v" />
         <button
           className="icon-btn danger-btn"
           title="Reset browser"
