@@ -1,6 +1,7 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::OnceLock, time::Duration};
 
 use anyhow::Context;
+use base64::Engine;
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -12,14 +13,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     fs,
-    io::AsyncReadExt,
-    process::{Child, ChildStdout, Command},
-    sync::{broadcast, mpsc, Mutex},
+    process::{Child, Command},
+    sync::{broadcast, mpsc},
     time::interval,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+// ── Global persistent input channel ────────────────────────────────────────
+static INPUT_TX: OnceLock<mpsc::Sender<serde_json::Value>> = OnceLock::new();
+
+fn input_tx() -> Option<&'static mpsc::Sender<serde_json::Value>> {
+    INPUT_TX.get()
+}
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
@@ -38,22 +45,22 @@ async fn main() -> anyhow::Result<()> {
     let identity = load_or_register(&config).await?;
     save_identity(&config, &identity).await?;
 
-    // Start Xvfb, Chrome, ffmpeg once; keep handles alive for the whole process.
-    let (_handles, ffmpeg_stdout) = start_browser_processes().await?;
+    // Start Chrome headless; keep handle alive for the whole process.
+    let _chrome = start_chrome().await?;
 
-    // Shared init-segment cache: the first fMP4 chunk, re-sent to every new
-    // WS client so it can decode subsequent media segments.
-    let init_cache: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    // Broadcast channel: ffmpeg reader → all active WS connections.
-    let (video_tx, _) = broadcast::channel::<Bytes>(64);
+    // Broadcast channel: screencast reader → all active WS connections.
+    let (video_tx, _) = broadcast::channel::<Bytes>(128);
 
-    tokio::spawn(ffmpeg_reader_task(
-        ffmpeg_stdout,
-        init_cache.clone(),
-        video_tx.clone(),
-    ));
+    // Persistent input channel: all input/navigate commands go through here
+    // to avoid creating a new CDP WS connection per event.
+    let (input_chan_tx, input_chan_rx) = mpsc::channel::<serde_json::Value>(256);
+    INPUT_TX.set(input_chan_tx).expect("input_tx already set");
+    tokio::spawn(input_loop(input_chan_rx));
 
-    connect_loop(config, identity, init_cache, video_tx).await
+    // Start CDP screencast task
+    tokio::spawn(screencast_loop(video_tx.clone()));
+
+    connect_loop(config, identity, video_tx).await
 }
 
 // ── Config / identity ────────────────────────────────────────────────────────
@@ -132,258 +139,146 @@ async fn save_identity(config: &AgentConfig, identity: &AgentIdentity) -> anyhow
     Ok(())
 }
 
-// ── Process management ───────────────────────────────────────────────────────
+// ── Chrome process ───────────────────────────────────────────────────────────
 
-struct ProcessHandles {
-    _xvfb: Child,
-    _chrome: Child,
-    _ffmpeg: Child,
-}
-
-async fn start_browser_processes() -> anyhow::Result<(ProcessHandles, ChildStdout)> {
-    // Clean up any stale X lock / socket files from a previous run.
-    for path in &[
-        "/tmp/.X99-lock",
-        "/tmp/.X11-unix/X99",
-    ] {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-
-    // 1. Xvfb
-    info!("Starting Xvfb on :99 …");
-    let xvfb = Command::new("Xvfb")
-        .args([":99", "-screen", "0", "1280x720x24"])
-        .spawn()
-        .context("failed to spawn Xvfb")?;
-    // Give the display time to initialise before Chrome tries to use it.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // 2. Chromium
-    info!("Starting chromium …");
+async fn start_chrome() -> anyhow::Result<Child> {
+    info!("Starting Chrome headless …");
     let chrome = Command::new("chromium")
         .args([
-            "--headless=false",
+            "--headless=new",
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--remote-debugging-port=9222",
-            "--display=:99",
+            "--remote-debugging-address=0.0.0.0",
+            "--disable-gpu",
             "--window-size=1280,720",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-client-side-phishing-detection",
+            "--disable-sync",
+            "about:blank",
         ])
-        .env("DISPLAY", ":99")
         .spawn()
         .context("failed to spawn chromium")?;
 
-    // Wait until the CDP HTTP endpoint responds (up to 10 s).
+    // Wait until the CDP HTTP endpoint responds (up to 15 s).
     let http = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(r) = http.get("http://localhost:9222/json/version").send().await {
             if r.status().is_success() {
                 info!("Chrome CDP ready");
+                ensure_page_target().await?;
                 break;
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("Chrome CDP did not become available within 10 s");
+            anyhow::bail!("Chrome CDP did not become available within 15 s");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // 3. ffmpeg – capture :99, encode as fMP4, write to stdout
-    info!("Starting ffmpeg screen capture …");
-    let mut ffmpeg = Command::new("ffmpeg")
-        .args([
-            "-f",
-            "x11grab",
-            "-r",
-            "15",
-            "-s",
-            "1280x720",
-            "-i",
-            ":99",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-tune",
-            "zerolatency",
-            "-profile:v",
-            "baseline",
-            "-level",
-            "3.0",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "mp4",
-            "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
-            "-frag_duration",
-            "1000000",
-            "-an",
-            "-",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("failed to spawn ffmpeg")?;
+    Ok(chrome)
+}
 
-    let stdout = ffmpeg.stdout.take().context("ffmpeg stdout unavailable")?;
-    Ok((
-        ProcessHandles {
-            _xvfb: xvfb,
-            _chrome: chrome,
-            _ffmpeg: ffmpeg,
-        },
-        stdout,
+// ── CDP Screencast loop ──────────────────────────────────────────────────────
+
+/// Connects to Chrome CDP, starts Page.startScreencast, and broadcasts
+/// JPEG frames to all connected WS clients.
+async fn screencast_loop(video_tx: broadcast::Sender<Bytes>) {
+    loop {
+        if let Err(e) = run_screencast(&video_tx).await {
+            warn!("screencast error: {e}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn run_screencast(video_tx: &broadcast::Sender<Bytes>) -> anyhow::Result<()> {
+    let target = ensure_page_target().await?;
+    let ws_url = target["webSocketDebuggerUrl"]
+        .as_str()
+        .context("target missing webSocketDebuggerUrl")?;
+
+    let (mut cdp_ws, _) = connect_async(ws_url)
+        .await
+        .context("CDP WS connect failed")?;
+
+    // Start screencast
+    cdp_ws.send(Message::Text(
+        json!({
+            "id": 1,
+            "method": "Page.startScreencast",
+            "params": {
+                "format": "jpeg",
+                "quality": 80,
+                "maxWidth": 1280,
+                "maxHeight": 720,
+                "everyNthFrame": 1
+            }
+        })
+        .to_string(),
     ))
-}
+    .await?;
 
-// ── ffmpeg reader – runs for the lifetime of the process ────────────────────
-
-/// Reads ffmpeg stdout in 16 KB chunks, wraps each in a `VideoFrame`, and
-/// broadcasts encoded bytes to all active WS connections.
-/// The very first chunk is the fMP4 init segment and is cached so that
-/// late-joining clients can still decode the stream.
-async fn ffmpeg_reader_task(
-    mut stdout: ChildStdout,
-    init_cache: Arc<Mutex<Option<Bytes>>>,
-    video_tx: broadcast::Sender<Bytes>,
-) {
-    let mut buf = vec![0u8; 16 * 1024];
+    info!("CDP screencast started");
     let mut sequence: u64 = 0;
-    // Accumulate pre-fragment MP4 boxes (ftyp + moov) before the first moof box.
-    let mut init_buf: Vec<u8> = Vec::new();
-    let mut init_done = false;
 
     loop {
-        match stdout.read(&mut buf).await {
-            Ok(0) => {
-                warn!("ffmpeg stdout closed (EOF)");
-                break;
-            }
-            Ok(n) => {
-                let chunk = &buf[..n];
+        match cdp_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
 
-                if !init_done {
-                    init_buf.extend_from_slice(chunk);
-                    // Check if we've received a moof box — that signals end of init.
-                    if contains_box(&init_buf, b"moof") {
-                        // Split: everything before the first moof is init, the rest is the first media chunk.
-                        let moof_offset = find_box_offset(&init_buf, b"moof").unwrap_or(init_buf.len());
-                        let init_payload = Bytes::copy_from_slice(&init_buf[..moof_offset]);
-                        let media_payload = Bytes::copy_from_slice(&init_buf[moof_offset..]);
-                        init_done = true;
+                if value.get("method").and_then(|v| v.as_str()) == Some("Page.screencastFrame") {
+                    let params = &value["params"];
+                    let session_id = params["sessionId"].as_i64().unwrap_or(0);
+                    let data_b64 = params["data"].as_str().unwrap_or("");
 
-                        let init_encoded = encode_video_frame(&VideoFrame {
-                            frame_type: VideoFrameType::Init,
+                    // Decode base64 JPEG
+                    if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                        let ts = Utc::now().timestamp_millis() as u64;
+                        let encoded = encode_video_frame(&VideoFrame {
+                            frame_type: VideoFrameType::Jpeg,
                             stream_id: 0,
-                            sequence: 0,
-                            timestamp_ms: 0,
-                            payload: init_payload,
+                            sequence,
+                            timestamp_ms: ts,
+                            payload: Bytes::from(jpeg_bytes),
                         });
-                        *init_cache.lock().await = Some(init_encoded.clone());
+                        sequence += 1;
                         if video_tx.receiver_count() > 0 {
-                            let _ = video_tx.send(init_encoded);
-                        }
-
-                        if !media_payload.is_empty() {
-                            let ts = Utc::now().timestamp_millis() as u64;
-                            let media_encoded = encode_video_frame(&VideoFrame {
-                                frame_type: VideoFrameType::Media,
-                                stream_id: 0,
-                                sequence,
-                                timestamp_ms: ts,
-                                payload: media_payload,
-                            });
-                            sequence += 1;
-                            if video_tx.receiver_count() > 0 {
-                                let _ = video_tx.send(media_encoded);
-                            }
+                            let _ = video_tx.send(encoded);
                         }
                     }
-                    // else keep buffering until we see moof
-                } else {
-                    let ts = Utc::now().timestamp_millis() as u64;
-                    let encoded = encode_video_frame(&VideoFrame {
-                        frame_type: VideoFrameType::Media,
-                        stream_id: 0,
-                        sequence,
-                        timestamp_ms: ts,
-                        payload: Bytes::copy_from_slice(chunk),
+
+                    // Acknowledge the frame
+                    let ack = json!({
+                        "id": 100 + session_id,
+                        "method": "Page.screencastFrameAck",
+                        "params": { "sessionId": session_id }
                     });
-                    sequence += 1;
-                    if video_tx.receiver_count() > 0 {
-                        let _ = video_tx.send(encoded);
+                    if cdp_ws.send(Message::Text(ack.to_string())).await.is_err() {
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                error!("ffmpeg read error: {e}");
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Err(e)) => {
+                error!("CDP WS error: {e}");
                 break;
             }
-        }
-    }
-}
-
-/// Returns true if `data` contains an MP4 box with the given 4-byte type.
-fn contains_box(data: &[u8], box_type: &[u8; 4]) -> bool {
-    find_box_offset(data, box_type).is_some()
-}
-
-/// Returns the byte offset of the first MP4 box with the given type, or None.
-fn find_box_offset(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
-    let mut pos = 0usize;
-    while pos + 8 <= data.len() {
-        let size = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
-        let t = &data[pos+4..pos+8];
-        if t == box_type {
-            return Some(pos);
-        }
-        if size < 8 { break; } // guard against malformed data
-        pos += size;
-    }
-    None
-}
-
-// ── Per-connection tasks ─────────────────────────────────────────────────────
-
-/// Sends the cached init segment to the WS client (so the player can decode),
-/// then forwards every subsequent broadcast frame.
-async fn video_stream_task(
-    init_cache: Arc<Mutex<Option<Bytes>>>,
-    mut video_rx: broadcast::Receiver<Bytes>,
-    tx: mpsc::Sender<Message>,
-) {
-    // Subscribe before reading the cache so no frame is missed.
-    {
-        let guard = init_cache.lock().await;
-        if let Some(init) = guard.clone() {
-            if tx.send(Message::Binary(init.to_vec())).await.is_err() {
-                return;
-            }
+            _ => {}
         }
     }
 
-    loop {
-        match video_rx.recv().await {
-            Ok(data) => {
-                if tx.send(Message::Binary(data.to_vec())).await.is_err() {
-                    break;
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!("video stream lagged by {n} frames");
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }
+    Ok(())
 }
 
-/// Polls Chrome's `/json/list` every 2 s and pushes a `tab.list` message
-/// whenever the tab set changes.
+// ── Tab poll task ────────────────────────────────────────────────────────────
+
 async fn tab_poll_task(tx: mpsc::Sender<Message>, _identity: AgentIdentity) {
     let mut ticker = interval(Duration::from_secs(2));
     let mut prev_fingerprints: Vec<String> = Vec::new();
@@ -400,7 +295,6 @@ async fn tab_poll_task(tx: mpsc::Sender<Message>, _identity: AgentIdentity) {
         };
 
         let tabs = cdp_to_browser_tabs(&targets);
-        // Use a fingerprint (id+url+title) to detect changes.
         let fingerprints: Vec<String> = tabs
             .iter()
             .map(|t| format!("{}|{}|{}", t.id, t.url, t.title))
@@ -416,7 +310,158 @@ async fn tab_poll_task(tx: mpsc::Sender<Message>, _identity: AgentIdentity) {
     }
 }
 
+// ── Video stream task ────────────────────────────────────────────────────────
+
+async fn video_stream_task(
+    mut video_rx: broadcast::Receiver<Bytes>,
+    tx: mpsc::Sender<Message>,
+) {
+    loop {
+        match video_rx.recv().await {
+            Ok(data) => {
+                if tx.send(Message::Binary(data.to_vec())).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("video stream lagged by {n} frames");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 // ── CDP helpers ──────────────────────────────────────────────────────────────
+
+/// Persistent input loop: keeps a single CDP WebSocket open and forwards all
+/// input / navigate commands without the overhead of a new handshake per event.
+async fn input_loop(mut rx: mpsc::Receiver<serde_json::Value>) {
+    loop {
+        match run_input_session(&mut rx).await {
+            Ok(()) => warn!("input CDP session closed, reconnecting in 500ms"),
+            Err(e) => warn!("input CDP session error: {e}, reconnecting in 500ms"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn run_input_session(rx: &mut mpsc::Receiver<serde_json::Value>) -> anyhow::Result<()> {
+    let target = ensure_page_target().await?;
+    let ws_url = target["webSocketDebuggerUrl"]
+        .as_str()
+        .context("target has no webSocketDebuggerUrl")?;
+    let (ws, _) = connect_async(ws_url)
+        .await
+        .context("input CDP WS connect failed")?;
+    let (mut write, mut read) = ws.split();
+    info!("input CDP session connected");
+
+    let mut cmd_id: u64 = 1000;
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some(payload) = msg else { return Ok(()); };
+                let commands = build_input_cdp_commands(&mut cmd_id, &payload);
+                if !commands.is_empty() {
+                    info!("input CDP sending {} command(s) for type={}", commands.len(), payload["type"].as_str().unwrap_or("?"));
+                }
+                for cmd in commands {
+                    write.send(Message::Text(cmd)).await?;
+                }
+            }
+            item = read.next() => {
+                match item {
+                    None => return Ok(()),
+                    Some(Err(e)) => return Err(e.into()),
+                    Some(Ok(_)) => {} // ignore CDP responses
+                }
+            }
+        }
+    }
+}
+
+fn build_input_cdp_commands(cmd_id: &mut u64, payload: &serde_json::Value) -> Vec<String> {
+    let event_type = payload["type"].as_str().unwrap_or("");
+    let x = payload["x"].as_f64().unwrap_or(0.0);
+    let y = payload["y"].as_f64().unwrap_or(0.0);
+    let mut cmds = Vec::new();
+
+    match event_type {
+        "navigate.url" => {
+            let url = payload["url"].as_str().unwrap_or("about:blank");
+            cmds.push(json!({"id": *cmd_id, "method": "Page.navigate", "params": {"url": url}}).to_string());
+            *cmd_id += 1;
+        }
+        "navigate.back" => {
+            cmds.push(json!({"id": *cmd_id, "method": "Page.goBack", "params": {}}).to_string());
+            *cmd_id += 1;
+        }
+        "navigate.forward" => {
+            cmds.push(json!({"id": *cmd_id, "method": "Page.goForward", "params": {}}).to_string());
+            *cmd_id += 1;
+        }
+        "navigate.reload" => {
+            cmds.push(json!({"id": *cmd_id, "method": "Page.reload", "params": {}}).to_string());
+            *cmd_id += 1;
+        }
+        "click" => {
+            let button = payload["button"].as_str().unwrap_or("left");
+            let modifiers = payload["modifiers"].as_i64().unwrap_or(0);
+            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": 1, "modifiers": modifiers}}).to_string());
+            *cmd_id += 1;
+            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": 1, "modifiers": modifiers}}).to_string());
+            *cmd_id += 1;
+        }
+        "mousedown" => {
+            let button = payload["button"].as_str().unwrap_or("left");
+            let click_count = payload["clickCount"].as_i64().unwrap_or(1);
+            let modifiers = payload["modifiers"].as_i64().unwrap_or(0);
+            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": click_count, "modifiers": modifiers}}).to_string());
+            *cmd_id += 1;
+        }
+        "mouseup" => {
+            let button = payload["button"].as_str().unwrap_or("left");
+            let click_count = payload["clickCount"].as_i64().unwrap_or(1);
+            let modifiers = payload["modifiers"].as_i64().unwrap_or(0);
+            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": click_count, "modifiers": modifiers}}).to_string());
+            *cmd_id += 1;
+        }
+        "mousemove" => {
+            let modifiers = payload["modifiers"].as_i64().unwrap_or(0);
+            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers}}).to_string());
+            *cmd_id += 1;
+        }
+        "wheel" => {
+            let dx = payload["deltaX"].as_f64().unwrap_or(0.0);
+            let dy = payload["deltaY"].as_f64().unwrap_or(0.0);
+            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy}}).to_string());
+            *cmd_id += 1;
+        }
+        "keydown" | "keyup" => {
+            let key = payload["key"].as_str().unwrap_or("");
+            let code = payload["code"].as_str().unwrap_or("");
+            let text = payload["text"].as_str().unwrap_or("");
+            let modifiers = payload["modifiers"].as_i64().unwrap_or(0);
+            let key_code = payload["keyCode"].as_i64().unwrap_or(0);
+            let cdp_type = if event_type == "keydown" { "keyDown" } else { "keyUp" };
+            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchKeyEvent",
+                "params": {"type": cdp_type, "key": key, "code": code, "text": text,
+                           "modifiers": modifiers, "windowsVirtualKeyCode": key_code,
+                           "nativeVirtualKeyCode": key_code}}).to_string());
+            *cmd_id += 1;
+        }
+        other => warn!("unknown input event type: {other}"),
+    }
+    cmds
+}
+
+
 
 async fn cdp_get_targets() -> anyhow::Result<Vec<serde_json::Value>> {
     reqwest::Client::new()
@@ -429,161 +474,83 @@ async fn cdp_get_targets() -> anyhow::Result<Vec<serde_json::Value>> {
         .context("failed to parse /json/list")
 }
 
+async fn ensure_page_target() -> anyhow::Result<serde_json::Value> {
+    if let Some(target) = cdp_get_targets()
+        .await?
+        .into_iter()
+        .find(|t| t["type"].as_str() == Some("page"))
+    {
+        return Ok(target);
+    }
+
+    let client = reqwest::Client::new();
+    let created = client
+        .put("http://localhost:9222/json/new?about:blank")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+
+    if created["type"].as_str() == Some("page") {
+        Ok(created)
+    } else {
+        cdp_get_targets()
+            .await?
+            .into_iter()
+            .find(|t| t["type"].as_str() == Some("page"))
+            .context("no page target available after creating about:blank")
+    }
+}
+
 fn cdp_to_browser_tabs(targets: &[serde_json::Value]) -> Vec<BrowserTab> {
     targets
         .iter()
         .filter(|t| t["type"].as_str() == Some("page"))
-        .map(|t| BrowserTab {
+        .enumerate()
+        .map(|(i, t)| BrowserTab {
             id: t["id"].as_str().unwrap_or("").to_string(),
             title: t["title"].as_str().unwrap_or("").to_string(),
             url: t["url"].as_str().unwrap_or("").to_string(),
-            active: false,
+            active: i == 0, // first tab is always treated as active (main screencast target)
         })
         .collect()
 }
 
-/// Navigate the first `page` target to `url`.
 async fn handle_navigate(payload: &serde_json::Value) -> anyhow::Result<()> {
     let url = payload["url"].as_str().context("navigate.url: missing url")?;
-    let targets = cdp_get_targets().await?;
-    let target = targets
-        .iter()
-        .find(|t| t["type"].as_str() == Some("page"))
-        .context("no page target available")?;
-    let ws_url = target["webSocketDebuggerUrl"]
-        .as_str()
-        .context("target has no webSocketDebuggerUrl")?;
-
-    let (mut ws, _) = connect_async(ws_url)
-        .await
-        .context("CDP WS connect failed")?;
-    ws.send(Message::Text(
-        json!({"id":1,"method":"Page.navigate","params":{"url":url}}).to_string(),
-    ))
-    .await?;
-    ws.close(None).await.ok();
-    Ok(())
-}
-
-/// Dispatch a mouse event to the first `page` target.
-async fn handle_input_event(payload: &serde_json::Value) -> anyhow::Result<()> {
-    let targets = cdp_get_targets().await?;
-    let target = targets
-        .iter()
-        .find(|t| t["type"].as_str() == Some("page"))
-        .context("no page target available")?;
-    let ws_url = target["webSocketDebuggerUrl"]
-        .as_str()
-        .context("target has no webSocketDebuggerUrl")?;
-
-    let (mut ws, _) = connect_async(ws_url)
-        .await
-        .context("CDP WS connect failed")?;
-
-    let event_type = payload["type"].as_str().unwrap_or("");
-    let x = payload["x"].as_f64().unwrap_or(0.0);
-    let y = payload["y"].as_f64().unwrap_or(0.0);
-
-    match event_type {
-        "click" => {
-            let button = payload["button"].as_str().unwrap_or("left");
-            let modifiers = payload["modifiers"].as_i64().unwrap_or(0) as i64;
-            ws.send(Message::Text(
-                json!({"id":1,"method":"Input.dispatchMouseEvent",
-                       "params":{"type":"mousePressed","x":x,"y":y,
-                                 "button":button,"clickCount":1,
-                                 "modifiers":modifiers}})
-                .to_string(),
-            ))
-            .await?;
-            ws.send(Message::Text(
-                json!({"id":2,"method":"Input.dispatchMouseEvent",
-                       "params":{"type":"mouseReleased","x":x,"y":y,
-                                 "button":button,"clickCount":1,
-                                 "modifiers":modifiers}})
-                .to_string(),
-            ))
-            .await?;
-        }
-        "wheel" => {
-            let dx = payload["deltaX"].as_f64().unwrap_or(0.0);
-            let dy = payload["deltaY"].as_f64().unwrap_or(0.0);
-            ws.send(Message::Text(
-                json!({"id":1,"method":"Input.dispatchMouseEvent",
-                       "params":{"type":"mouseWheel","x":x,"y":y,
-                                 "deltaX":dx,"deltaY":dy}})
-                .to_string(),
-            ))
-            .await?;
-        }
-        "keydown" | "keyup" => {
-            let key = payload["key"].as_str().unwrap_or("");
-            let code = payload["code"].as_str().unwrap_or("");
-            let text = payload["text"].as_str().unwrap_or("");
-            let modifiers = payload["modifiers"].as_i64().unwrap_or(0) as i64;
-            let key_code = payload["keyCode"].as_i64().unwrap_or(0) as i64;
-            let cdp_event_type = if event_type == "keydown" { "keyDown" } else { "keyUp" };
-            ws.send(Message::Text(
-                json!({"id":1,"method":"Input.dispatchKeyEvent",
-                       "params":{"type":cdp_event_type,"key":key,"code":code,
-                                 "text":text,"modifiers":modifiers,
-                                 "windowsVirtualKeyCode":key_code,
-                                 "nativeVirtualKeyCode":key_code}})
-                .to_string(),
-            ))
-            .await?;
-        }
-        "mousedown" => {
-            let button = payload["button"].as_str().unwrap_or("left");
-            let click_count = payload["clickCount"].as_i64().unwrap_or(1) as i64;
-            let modifiers = payload["modifiers"].as_i64().unwrap_or(0) as i64;
-            ws.send(Message::Text(
-                json!({"id":1,"method":"Input.dispatchMouseEvent",
-                       "params":{"type":"mousePressed","x":x,"y":y,
-                                 "button":button,"clickCount":click_count,
-                                 "modifiers":modifiers}})
-                .to_string(),
-            ))
-            .await?;
-        }
-        "mouseup" => {
-            let button = payload["button"].as_str().unwrap_or("left");
-            let click_count = payload["clickCount"].as_i64().unwrap_or(1) as i64;
-            let modifiers = payload["modifiers"].as_i64().unwrap_or(0) as i64;
-            ws.send(Message::Text(
-                json!({"id":1,"method":"Input.dispatchMouseEvent",
-                       "params":{"type":"mouseReleased","x":x,"y":y,
-                                 "button":button,"clickCount":click_count,
-                                 "modifiers":modifiers}})
-                .to_string(),
-            ))
-            .await?;
-        }
-        "mousemove" => {
-            let modifiers = payload["modifiers"].as_i64().unwrap_or(0) as i64;
-            ws.send(Message::Text(
-                json!({"id":1,"method":"Input.dispatchMouseEvent",
-                       "params":{"type":"mouseMoved","x":x,"y":y,
-                                 "modifiers":modifiers}})
-                .to_string(),
-            ))
-            .await?;
-        }
-        other => warn!("unknown input event type: {other}"),
+    if let Some(tx) = input_tx() {
+        let _ = tx.try_send(json!({"type": "navigate.url", "url": url}));
     }
-
-    ws.close(None).await.ok();
     Ok(())
 }
 
-/// Open / close / activate a Chrome tab.
+async fn handle_navigate_history(method: &str) -> anyhow::Result<()> {
+    let event_type = match method {
+        "Page.goBack" => "navigate.back",
+        "Page.goForward" => "navigate.forward",
+        "Page.reload" => "navigate.reload",
+        _ => return Ok(()),
+    };
+    if let Some(tx) = input_tx() {
+        let _ = tx.try_send(json!({"type": event_type}));
+    }
+    Ok(())
+}
+
+async fn handle_input_event(payload: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(tx) = input_tx() {
+        let _ = tx.try_send(payload.clone());
+    }
+    Ok(())
+}
+
 async fn handle_tab_command(payload: &serde_json::Value) -> anyhow::Result<()> {
     info!("handle_tab_command: {:?}", payload);
     let client = reqwest::Client::new();
     match payload["command"].as_str().unwrap_or("") {
         "new" | "open" => {
             let url = payload["url"].as_str().unwrap_or("about:blank");
-            // Chrome's /json/new endpoint — use PUT (more compatible across Chrome versions)
             let resp_text = client
                 .put(format!("http://localhost:9222/json/new?{url}"))
                 .send()
@@ -592,7 +559,6 @@ async fn handle_tab_command(payload: &serde_json::Value) -> anyhow::Result<()> {
                 .await
                 .unwrap_or_default();
             info!("json/new response: {:?}", &resp_text[..resp_text.len().min(200)]);
-            // Navigate to URL if one was provided
             if url != "about:blank" {
                 let resp: serde_json::Value = serde_json::from_str(&resp_text)
                     .unwrap_or(serde_json::Value::Null);
@@ -694,8 +660,19 @@ async fn handle_browser_reset(_payload: &serde_json::Value) -> anyhow::Result<()
 }
 
 async fn dispatch_control_message(msg: ControlToAgentMessage) {
+    if msg.kind == "input.event" {
+        let evt = msg.payload["type"].as_str().unwrap_or("?");
+        let x = msg.payload["x"].as_f64().unwrap_or(-1.0);
+        let y = msg.payload["y"].as_f64().unwrap_or(-1.0);
+        info!("input.event type={evt} x={x:.0} y={y:.0}");
+    } else {
+        info!("control message: {}", msg.kind);
+    }
     let result = match msg.kind.as_str() {
         "navigate.url" => handle_navigate(&msg.payload).await,
+        "navigate.back" => handle_navigate_history("Page.goBack").await,
+        "navigate.forward" => handle_navigate_history("Page.goForward").await,
+        "navigate.reload" => handle_navigate_history("Page.reload").await,
         "input.event" => handle_input_event(&msg.payload).await,
         "tab.command" => handle_tab_command(&msg.payload).await,
         "browser.reset" => handle_browser_reset(&msg.payload).await,
@@ -714,16 +691,14 @@ async fn dispatch_control_message(msg: ControlToAgentMessage) {
 async fn connect_loop(
     config: AgentConfig,
     mut identity: AgentIdentity,
-    init_cache: Arc<Mutex<Option<Bytes>>>,
     video_tx: broadcast::Sender<Bytes>,
 ) -> anyhow::Result<()> {
     loop {
-        match connect_once(&config, &identity, init_cache.clone(), video_tx.clone()).await {
+        match connect_once(&config, &identity, video_tx.clone()).await {
             Ok(()) => warn!("agent websocket disconnected"),
             Err(err) => {
                 let msg = err.to_string();
                 warn!(error = %msg, "agent websocket failed");
-                // Re-register if our runtime token was rejected (e.g. control plane restarted).
                 if msg.contains("401") || msg.contains("Unauthorized") {
                     warn!("runtime token rejected — deleting identity and re-registering");
                     let id_path = config.data_dir.join("identity.json");
@@ -747,7 +722,6 @@ async fn connect_loop(
 async fn connect_once(
     config: &AgentConfig,
     identity: &AgentIdentity,
-    init_cache: Arc<Mutex<Option<Bytes>>>,
     video_tx: broadcast::Sender<Bytes>,
 ) -> anyhow::Result<()> {
     let request = http_request_with_bearer(
@@ -758,10 +732,8 @@ async fn connect_once(
     let (mut ws_write, mut ws_read) = socket.split();
     info!("agent websocket connected");
 
-    // mpsc channel: all background tasks → single WS writer task.
     let (tx, mut rx) = mpsc::channel::<Message>(256);
 
-    // Task: drain the mpsc channel and write to the WebSocket.
     let writer_handle = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_write.send(msg).await.is_err() {
@@ -770,11 +742,9 @@ async fn connect_once(
         }
     });
 
-    // Task: stream video frames to this WS client.
     let video_rx = video_tx.subscribe();
-    let video_handle = tokio::spawn(video_stream_task(init_cache, video_rx, tx.clone()));
+    let video_handle = tokio::spawn(video_stream_task(video_rx, tx.clone()));
 
-    // Task: poll Chrome tabs and push changes.
     let tab_handle = tokio::spawn(tab_poll_task(tx.clone(), identity.clone()));
 
     let mut heartbeat = interval(Duration::from_secs(5));

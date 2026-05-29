@@ -8,19 +8,13 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     chromium \
-    ffmpeg \
     fonts-noto-cjk \
     fonts-noto-color-emoji \
-    xvfb \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 10001 jbrowser \
-    && mkdir -p /tmp/.X11-unix \
-    && chmod 1777 /tmp/.X11-unix
+    && useradd -m -u 10001 jbrowser
 COPY --from=builder /app/target/release/jbrowser-agent /usr/local/bin/jbrowser-agent
 USER jbrowser
-ENV DISPLAY=:99
 ENV BROWSER_TYPE=chromium
 ENV BROWSER_VERSION=container
 ENV AGENT_DATA_DIR=/home/jbrowser/.local/share/jbrowser-agent
 CMD ["jbrowser-agent"]
-

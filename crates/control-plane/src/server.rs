@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use jbrowser_shared::{
     constants::{DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH},
     models::{AgentStatus, AgentSummary, BrowserInstance, BrowserStatus, BrowserTab},
-    protocol::{decode_video_frame, ClientMessage, ServerMessage, VideoFrameType},
+    protocol::{decode_video_frame, ClientMessage, ServerMessage},
 };
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::{rngs::OsRng, RngCore};
@@ -86,8 +86,6 @@ pub struct AppState {
     browser_preview: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Vec<u8>>>>>,
     /// Per-browser event broadcast: browser_id → broadcast::Sender<String (JSON)>
     browser_events: Arc<RwLock<HashMap<Uuid, broadcast::Sender<String>>>>,
-    /// Cached init segment per browser (sent to new subscribers so MSE can decode)
-    browser_init_segments: Arc<RwLock<HashMap<Uuid, Vec<u8>>>>,
 }
 
 impl AppState {
@@ -101,7 +99,6 @@ impl AppState {
             agent_senders: Arc::new(RwLock::new(HashMap::new())),
             browser_preview: Arc::new(RwLock::new(HashMap::new())),
             browser_events: Arc::new(RwLock::new(HashMap::new())),
-            browser_init_segments: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -876,10 +873,7 @@ async fn handle_agent_socket(
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        if let Ok(frame) = decode_video_frame(bytes.clone().into()) {
-                            if frame.frame_type == VideoFrameType::Init {
-                                state.browser_init_segments.write().await.insert(browser_id, bytes.clone());
-                            }
+                        if let Ok(_frame) = decode_video_frame(bytes.clone().into()) {
                             let _ = bcast_tx.send(bytes.clone());
                             let _ = state.preview_tx.send(bytes);
                         }
@@ -901,7 +895,6 @@ async fn handle_agent_socket(
     state.agent_senders.write().await.remove(&agent_id);
     state.browser_preview.write().await.remove(&browser_id);
     state.browser_events.write().await.remove(&browser_id);
-    state.browser_init_segments.write().await.remove(&browser_id);
     let mut store = state.store.write().await;
     if let Some(a) = store.agents.get_mut(&agent_id) {
         a.status = AgentStatus::Offline;
@@ -1035,11 +1028,6 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                                 // Subscribe to per-browser event channel
                                 let ev_map = state.browser_events.read().await;
                                 events_rx = ev_map.get(&bid).map(|tx| tx.subscribe());
-                                // Send cached init segment so MSE can decode from any point
-                                let init_map = state.browser_init_segments.read().await;
-                                if let Some(init) = init_map.get(&bid) {
-                                    let _ = sender.send(Message::Binary(init.clone())).await;
-                                }
                             }
                         }
                     }
@@ -1123,7 +1111,7 @@ async fn handle_control_text(
                 .await;
             }
         }
-        "input.event" | "tab.command" | "browser.reset" | "navigate.url" => {
+        "input.event" | "tab.command" | "browser.reset" | "navigate.url" | "navigate.back" | "navigate.forward" | "navigate.reload" => {
             // Resolve target browser
             let browser_id = message
                 .payload
@@ -1141,7 +1129,7 @@ async fn handle_control_text(
                     match message.kind.as_str() {
                         "input.event" => "input.dispatched",
                         "tab.command" => "tab.command_requested",
-                        "navigate.url" => "navigate.requested",
+                        "navigate.url" | "navigate.back" | "navigate.forward" | "navigate.reload" => "navigate.requested",
                         _ => "browser.reset_requested",
                     },
                     "web_ui",

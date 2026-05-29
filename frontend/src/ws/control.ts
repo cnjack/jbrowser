@@ -7,12 +7,18 @@ export type ControlEvent =
 export class ControlSocket {
   private socket: WebSocket | null = null;
 
-  connect(token: string, onEvent: (event: ControlEvent) => void) {
+  connect(
+    token: string,
+    onEvent: (event: ControlEvent) => void,
+    onConnected?: () => void,
+    onDisconnected?: () => void,
+  ) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     this.socket = new WebSocket(`${protocol}//${window.location.host}/ws/control`);
     this.socket.binaryType = 'arraybuffer';
     this.socket.onopen = () => {
       this.send({ type: 'auth', payload: { token } });
+      onConnected?.();
     };
     this.socket.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
@@ -27,6 +33,9 @@ export class ControlSocket {
       ) {
         onEvent({ type: message.type, payload: message.payload });
       }
+    };
+    this.socket.onclose = () => {
+      onDisconnected?.();
     };
   }
 

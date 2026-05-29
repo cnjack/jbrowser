@@ -28,14 +28,12 @@ graph TB
 
     subgraph AgentBox["Agent (Rust)"]
         subgraph ProcSup["Process Supervisor (tokio tasks)"]
-            Xvfb["Xvfb :99"]
-            Chrome["Chrome/Chromium\n--display=:99"]
-            FFmpegProc["ffmpeg\nx11grab → H264 → fMP4 stdout"]
+            Chrome["Chrome/Chromium\n--headless=new\n--remote-debugging-port=9222"]
         end
-        CDPInt["CDP Client (internal)"]
-        WSCli["WebSocket Client → Control Plane\nJSON control messages + binary video stream"]
+        CDPInt["CDP Screencast\n(Page.startScreencast → JPEG frames)"]
+        WSCli["WebSocket Client → Control Plane\nJSON control messages + binary JPEG frames"]
         Chrome -->|"CDP localhost:9222"| CDPInt
-        FFmpegProc -->|"fMP4 segments"| WSCli
+        CDPInt -->|"JPEG frames"| WSCli
     end
 
     WebUI -->|"HTTP/WS"| ControlPlane
@@ -289,13 +287,19 @@ fn build_router(state: AppState) -> Router {
 ```mermaid
 graph TD
     Agent["agent (PID 1 in container)"]
-    Xvfb["Xvfb :99 -screen 0 1280x720x24 -nolisten tcp"]
-    Chrome["chrome --headless=new --remote-debugging-port=9222 --display=:99"]
-    FFmpeg["ffmpeg -f x11grab ... pipe:1\n(launched on-demand when preview.start received)"]
-    Agent --> Xvfb
+    Chrome["Chrome/Chromium\n--headless=new --remote-debugging-port=9222"]
     Agent --> Chrome
-    Agent --> FFmpeg
 ```
+
+**设计决策**：使用 CDP `Page.startScreencast` 替代 Xvfb + ffmpeg 方案。
+
+| 对比项 | ~~Xvfb + x11grab + ffmpeg~~ | CDP Screencast（当前方案） |
+|-------|---------------------------|--------------------------|
+| 兼容性 | ❌ Debian chromium wrapper 强制 `--ozone-platform=headless`，覆盖 `--display=:99` | ✅ Chrome headless 原生支持 |
+| 依赖 | Xvfb + ffmpeg + x11grab 内核模块 | 只需 Chrome |
+| 延迟 | ~200ms（frag_duration） | ~50-100ms |
+| 格式 | fMP4 / H.264（需 MSE） | JPEG 帧（直接 `<img>` 渲染） |
+| 复杂度 | 高（三进程 + X11 + MSE init segment 边界解析） | 低 |
 
 ### 4.2 Agent 启动流程
 
@@ -308,51 +312,48 @@ flowchart TD
     C -->|失败 401| F
     F --> D[获取 agent_id, browser_instance_id, agent_runtime_token]
     D --> E[保存 identity 到 data dir]
-    E --> G[启动 Xvfb]
-    G --> H["等待 Xvfb ready (/tmp/.X11-unix/X99)"]
-    H --> I[启动 Chrome/Chromium on display :99]
+    E --> I["启动 Chrome/Chromium --headless=new --remote-debugging-port=9222"]
     I --> J[等待 Chrome CDP ready on localhost:9222]
-    J --> K[连接内部 CDP WebSocket]
+    J --> K["确保 page target 存在（PUT /json/new?about:blank）"]
     K --> L[建立到 Control Plane 的 WebSocket 长连接]
-    L --> M[上报 browser instance info]
+    L --> M[上报 browser instance info + tab list]
     M --> N[开始 heartbeat loop]
     N --> O[监听 Control Plane commands]
 ```
 
-### 4.3 ffmpeg 启动参数（按需启动）
+### 4.3 CDP Screencast 参数
 
-```text
-ffmpeg \
-  -f x11grab \
-  -video_size 1280x720 \
-  -framerate 15 \
-  -draw_mouse 1 \
-  -i :99 \
-  -c:v libx264 \
-  -preset ultrafast \
-  -tune zerolatency \
-  -profile:v baseline \
-  -level 3.1 \
-  -b:v 2M \
-  -maxrate 3M \
-  -bufsize 1M \
-  -g 30 \
-  -keyint_min 15 \
-  -sc_threshold 0 \
-  -f mp4 \
-  -movflags +frag_keyframe+empty_moov+default_base_moof \
-  -frag_duration 200000 \
-  -reset_timestamps 1 \
-  pipe:1
+```typescript
+// Agent 调用 Page.startScreencast 开始推帧
+{
+  method: "Page.startScreencast",
+  params: {
+    format: "jpeg",      // JPEG 格式，低延迟
+    quality: 80,         // 质量/体积平衡
+    maxWidth: 1280,
+    maxHeight: 720,
+    everyNthFrame: 1     // 每帧都推（15fps 由 Chrome 调度）
+  }
+}
 ```
 
-关键参数说明：
-- `preset ultrafast` + `tune zerolatency`: 最小编码延迟
-- `profile baseline`: 最大兼容性（MSE 播放）
-- `g 30` / `keyint_min 15`: 每 2s 一个 keyframe（15fps × 2 = 30 frames）
-- `frag_duration 200000`: 每 200ms 一个 fragment
-- `movflags +frag_keyframe+empty_moov+default_base_moof`: fMP4 格式，init segment 在开头
-- `pipe:1`: 输出到 stdout，Rust 进程读取
+帧到达事件：
+```typescript
+// Chrome → Agent 推送每一帧
+{
+  method: "Page.screencastFrame",
+  params: {
+    data: "<base64 JPEG>",
+    metadata: { timestamp, pageScaleFactor, offsetTop, deviceWidth, deviceHeight, scrollOffsetX, scrollOffsetY },
+    sessionId: number
+  }
+}
+// Agent 必须回复 Page.screencastFrameAck
+{
+  method: "Page.screencastFrameAck",
+  params: { sessionId: number }
+}
+```
 
 ### 4.4 Agent 内部模块交互
 
@@ -362,22 +363,19 @@ graph TB
         WSClient["WS Client\n(to control)"]
         CmdRouter["Command Router"]
         InputDispatch["Input Dispatcher\n(CDP inject)"]
-        StreamMux["Stream Mux\n(binary)"]
-        FFmpegReader["ffmpeg stdout reader"]
-        CDPCli["CDP Client\n(tab mgmt, input)"]
+        ScreencastReader["CDP Screencast Reader\n(Page.screencastFrame → JPEG bytes)"]
+        CDPCli["CDP Client\n(tab mgmt, input, screencast)"]
 
         WSClient -->|"commands"| CmdRouter
         CmdRouter -->|"responses"| WSClient
         CmdRouter -->|"dispatch"| InputDispatch
         InputDispatch -->|"CDP"| CDPCli
-        FFmpegReader -->|"fMP4 bytes"| StreamMux
-        StreamMux -->|"video segments"| WSClient
+        ScreencastReader -->|"JPEG frames"| WSClient
+        CDPCli -->|"screencastFrame events"| ScreencastReader
     end
 
     subgraph Supervisors["Supervisors"]
-        SupXvfb["Supervisor (Xvfb)"]
         SupChrome["Supervisor (Chrome)"]
-        SupFFmpeg["Supervisor (ffmpeg)"]
     end
 ```
 
@@ -385,17 +383,19 @@ graph TB
 
 ### 5.1 Agent ↔ Control Plane 协议
 
-单 WebSocket 连接，承载 JSON 控制消息 + 二进制视频 segment。
+单 WebSocket 连接，承载 JSON 控制消息 + 二进制 JPEG 帧。
 
 **帧格式（Binary frame）**：
 
 | Field | Size | Description |
 |-------|------|-------------|
-| `type` | 1 byte | `0x01` = video init segment, `0x02` = video media segment |
+| `type` | 1 byte | `0x03` = JPEG screencast frame |
 | `stream_id` | 4 bytes | 用于支持未来多流（预留） |
 | `seq` | 8 bytes | 单调递增序号 |
 | `ts_ms` | 8 bytes | 时间戳（毫秒） |
-| `payload` | variable | 原始 fMP4 bytes |
+| `payload` | variable | 原始 JPEG 字节（非 base64，已解码） |
+
+> **注意**：原 `0x01` init segment / `0x02` media segment 帧类型已废弃，统一使用 `0x03` JPEG 帧。
 
 **JSON 控制消息（Text frame）**：
 
@@ -452,16 +452,13 @@ sequenceDiagram
 
     UI->>CP: browser.subscribe {id}
     CP->>A: preview.start
-    Note right of A: start ffmpeg
+    Note right of A: CDP Page.startScreencast
     CP-->>UI: browser.state
     CP-->>UI: tab.list
 
-    A-->>CP: [binary] init segment
-    CP-->>UI: [binary] init segment
-
-    loop Continuous stream
-        A-->>CP: [binary] media seg #N
-        CP-->>UI: [binary] media seg #N (fan-out to viewers)
+    loop Continuous JPEG frames
+        A-->>CP: [binary] JPEG frame #N (type=0x03)
+        CP-->>UI: [binary] JPEG frame #N (fan-out to viewers)
     end
 ```
 
@@ -870,44 +867,45 @@ graph TB
 ### 10.2 MSE Video Player
 
 ```typescript
-class PreviewPlayer {
-  private mediaSource: MediaSource;
-  private sourceBuffer: SourceBuffer | null = null;
-  private queue: ArrayBuffer[] = [];
+### 10.2 CDP Screencast Player
 
-  async initialize(videoElement: HTMLVideoElement) {
-    this.mediaSource = new MediaSource();
-    videoElement.src = URL.createObjectURL(this.mediaSource);
-    
-    await new Promise(resolve => 
-      this.mediaSource.addEventListener('sourceopen', resolve, { once: true })
-    );
-  }
+切换到 CDP Screencast 后，前端不再使用 MSE + SourceBuffer，改为简单的 `<img>` 渲染：
 
-  handleInitSegment(data: ArrayBuffer) {
-    // 确定 codec，创建 SourceBuffer
-    this.sourceBuffer = this.mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01F"');
-    this.sourceBuffer.mode = 'segments';
-    this.appendBuffer(data);
-  }
+```typescript
+// 每帧接收 binary ArrayBuffer（type=0x03，21字节 header + JPEG payload）
+function handleScreencastFrame(data: ArrayBuffer) {
+  const payload = data.slice(21);  // skip 21-byte header
+  const blob = new Blob([payload], { type: 'image/jpeg' });
+  const url = URL.createObjectURL(blob);
 
-  handleMediaSegment(data: ArrayBuffer) {
-    this.appendBuffer(data);
-    // 保持 buffer 在 2s 以内，清除过旧数据
-    this.trimBuffer();
-  }
-
-  private trimBuffer() {
-    if (this.sourceBuffer && this.sourceBuffer.buffered.length > 0) {
-      const end = this.sourceBuffer.buffered.end(0);
-      const start = this.sourceBuffer.buffered.start(0);
-      if (end - start > 2) {
-        this.sourceBuffer.remove(start, end - 1);
-      }
-    }
+  // 渲染帧
+  if (imgRef.current) {
+    const old = imgRef.current.src;
+    imgRef.current.src = url;
+    // 释放前一帧的 Object URL，避免内存泄漏
+    if (old.startsWith('blob:')) URL.revokeObjectURL(old);
   }
 }
 ```
+
+前端组件使用 `<img>` 替代 `<video>`：
+
+```tsx
+<div style={{ position: 'relative', width: '100%', aspectRatio: '16/9' }}>
+  <img
+    ref={imgRef}
+    style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+    alt="browser preview"
+  />
+  {/* 鼠标/键盘输入透明层，覆盖在 img 上 */}
+  <InputOverlay onInput={sendInputEvent} />
+</div>
+```
+
+**优点**：
+- 无需 MSE、SourceBuffer、codec 字符串
+- 无需 init segment 缓存和时间戳同步
+- 浏览器原生 JPEG 解码，零延迟
 
 ### 10.3 页面结构
 
@@ -941,10 +939,8 @@ CMD ["control-plane"]
 ```dockerfile
 FROM debian:bookworm-slim
 
-# Install Xvfb, ffmpeg, chromium
+# Only chromium needed (no Xvfb, no ffmpeg)
 RUN apt-get update && apt-get install -y \
-    xvfb \
-    ffmpeg \
     chromium \
     fonts-noto-cjk \
     fonts-noto-color-emoji \
@@ -956,7 +952,6 @@ USER jbrowser
 
 COPY --from=builder /app/agent /usr/local/bin/jbrowser-agent
 
-ENV DISPLAY=:99
 ENV BROWSER_TYPE=chromium
 ENV BROWSER_PATH=/usr/bin/chromium
 

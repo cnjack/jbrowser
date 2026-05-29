@@ -3,3 +3,4 @@ pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 720;
 pub const DEFAULT_PREVIEW_FPS: u32 = 15;
 pub const VIDEO_INIT_FRAME: u8 = 0x01;
 pub const VIDEO_MEDIA_FRAME: u8 = 0x02;
+pub const VIDEO_JPEG_FRAME: u8 = 0x03;

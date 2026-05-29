@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { mapCoordinates } from '../utils/coordinates';
 import type { BrowserInstance } from '../api/types';
 
@@ -19,16 +19,7 @@ interface Props {
 
 // Header layout: 1 byte type | 4 bytes stream_id | 8 bytes sequence | 8 bytes timestamp_ms = 21 bytes
 const FRAME_HEADER_SIZE = 21;
-const FRAME_TYPE_INIT = 0x01;
-
-function stripHeader(buf: ArrayBuffer): { isInit: boolean; payload: ArrayBuffer } {
-  const view = new DataView(buf);
-  const frameType = view.getUint8(0);
-  return {
-    isInit: frameType === FRAME_TYPE_INIT,
-    payload: buf.slice(FRAME_HEADER_SIZE),
-  };
-}
+const FRAME_TYPE_JPEG = 0x03;
 
 const KEY_CODE_MAP: Record<string, number> = {
   Backspace: 8, Tab: 9, Enter: 13, Escape: 27, Space: 32,
@@ -52,141 +43,101 @@ const PREVENT_DEFAULT_KEYS = new Set([
   'Backspace', ' ', 'F1', 'F3', 'F5', 'F6',
 ]);
 
-// Try each codec string in order until one is supported.
-const CODEC_CANDIDATES = [
-  'video/mp4; codecs="avc1.42E01E"',  // H.264 Constrained Baseline 3.0
-  'video/mp4; codecs="avc1.42C01E"',  // H.264 Constrained Baseline 3.0 (alt flags)
-  'video/mp4; codecs="avc1.42001E"',  // H.264 Baseline 3.0 (no constraint flags)
-  'video/mp4; codecs="avc1.640028"',  // H.264 High 4.0 fallback
-];
-
-function pickCodec(): string | null {
-  if (typeof MediaSource === 'undefined') return null;
-  return CODEC_CANDIDATES.find((c) => MediaSource.isTypeSupported(c)) ?? null;
-}
-
-function drainQueue(sb: SourceBuffer, queue: ArrayBuffer[]) {
-  if (sb.updating || queue.length === 0) return;
-  const next = queue.shift()!;
-  try { sb.appendBuffer(next); } catch { /* quota / abort – skip */ }
-}
-
 export function InputOverlay({ browser, onInput, previewSegment }: Props) {
-  const divRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const msRef = useRef<MediaSource | null>(null);
-  const sbRef = useRef<SourceBuffer | null>(null);
-  // Segments received before MSE is ready are buffered here.
-  const queueRef = useRef<ArrayBuffer[]>([]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const imgPoolRef = useRef<HTMLImageElement[]>([]);
+  const [ripples, setRipples] = useState<{ id: number; x: number; y: number }[]>([]);
+  const rippleId = useRef(0);
 
-  // Initialise MSE once on mount.
+  // Maintain correct aspect-ratio CSS dimensions so that mapCoordinates stays accurate.
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const codec = pickCodec();
-    if (!codec) return;
+    const wrap = wrapRef.current;
+    const canvas = canvasRef.current;
+    if (!wrap || !canvas) return;
 
-    const ms = new MediaSource();
-    msRef.current = ms;
-    const objectUrl = URL.createObjectURL(ms);
-    video.src = objectUrl;
+    const vw = browser.viewport_width;
+    const vh = browser.viewport_height;
 
-    const onSourceOpen = () => {
-      try {
-        const sb = ms.addSourceBuffer(codec);
-        sbRef.current = sb;
-        sb.addEventListener('updateend', () => drainQueue(sb, queueRef.current));
-        // Drain anything buffered while MSE was initialising.
-        drainQueue(sb, queueRef.current);
-      } catch (err) {
-        console.error('[MSE] addSourceBuffer failed:', err);
-      }
+    const fit = () => {
+      const scale = Math.min(wrap.clientWidth / vw, wrap.clientHeight / vh);
+      canvas.style.width  = Math.floor(vw * scale) + 'px';
+      canvas.style.height = Math.floor(vh * scale) + 'px';
     };
 
-    ms.addEventListener('sourceopen', onSourceOpen);
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, [browser.viewport_width, browser.viewport_height]);
 
-    // Autoplay: start as soon as the browser has buffered enough.
-    const onCanPlay = () => { video.play().catch(() => {}); };
-    video.addEventListener('canplay', onCanPlay);
-
-    return () => {
-      ms.removeEventListener('sourceopen', onSourceOpen);
-      video.removeEventListener('canplay', onCanPlay);
-      URL.revokeObjectURL(objectUrl);
-      if (ms.readyState === 'open') {
-        try { ms.endOfStream(); } catch { /* ignore */ }
-      }
-    };
-  }, []);
-
-  // Append incoming binary segment to MSE (or pre-buffer if not ready yet).
+  // Render incoming JPEG frame to canvas using image pool
   useEffect(() => {
-    if (!previewSegment) return;
-    const { payload } = stripHeader(previewSegment);
-    if (payload.byteLength === 0) return;
+    if (!previewSegment || previewSegment.byteLength <= FRAME_HEADER_SIZE) return;
 
-    const sb = sbRef.current;
-    const ms = msRef.current;
+    const view = new DataView(previewSegment);
+    if (view.getUint8(0) !== FRAME_TYPE_JPEG) return;
 
-    if (!sb || ms?.readyState !== 'open') {
-      // MSE not ready yet — queue so we don't lose the init segment.
-      queueRef.current.push(payload);
-      // Keep queue bounded to avoid memory growth.
-      if (queueRef.current.length > 60) queueRef.current.shift();
-      return;
-    }
+    const jpeg = previewSegment.slice(FRAME_HEADER_SIZE);
+    if (jpeg.byteLength === 0) return;
 
-    if (sb.updating) {
-      queueRef.current.push(payload);
-    } else {
-      try { sb.appendBuffer(payload); } catch { /* quota / abort */ }
-    }
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx) return;
+
+    const pool = imgPoolRef.current;
+    const img = pool.pop() || new Image();
+    const blob = new Blob([jpeg], { type: 'image/jpeg' });
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      pool.push(img);
+    };
+    img.src = url;
   }, [previewSegment]);
 
-  // Mouse + keyboard event listeners (all in one effect)
+  // Mouse + keyboard event listeners
   useEffect(() => {
-    const el = divRef.current;
-    if (!el) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
     const mapCoords = (clientX: number, clientY: number) => {
-      const rect = el.getBoundingClientRect();
+      const rect = canvas.getBoundingClientRect();
       return mapCoordinates(clientX, clientY, rect, browser.viewport_width, browser.viewport_height);
     };
 
-    // --- Wheel ---
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
       const point = mapCoords(e.clientX, e.clientY);
-      const modifiers = getModifiers(e);
-      onInput({ type: 'wheel', x: point.x, y: point.y, deltaX: e.deltaX, deltaY: e.deltaY, modifiers });
+      onInput({ type: 'wheel', x: point.x, y: point.y, deltaX: e.deltaX, deltaY: e.deltaY, modifiers: getModifiers(e) });
     };
 
-    // --- Mouse buttons ---
     const handleMouseDown = (e: MouseEvent) => {
       e.preventDefault();
-      el.focus();
+      canvas.focus();
+      // Ripple position relative to canvas-wrap (not canvas), so it stays aligned
+      // even when canvas is centered/letterboxed inside the wrap.
+      const wrapRect = wrapRef.current!.getBoundingClientRect();
+      const cx = e.clientX - wrapRect.left;
+      const cy = e.clientY - wrapRect.top;
+      const id = ++rippleId.current;
+      setRipples((prev) => [...prev, { id, x: cx, y: cy }]);
+      setTimeout(() => setRipples((prev) => prev.filter((r) => r.id !== id)), 600);
       const point = mapCoords(e.clientX, e.clientY);
       const button = BTN_MAP[e.button] ?? 'left';
-      const modifiers = getModifiers(e);
-      onInput({ type: 'mousedown', x: point.x, y: point.y, button, clickCount: 1, modifiers });
+      onInput({ type: 'mousedown', x: point.x, y: point.y, button, clickCount: 1, modifiers: getModifiers(e) });
     };
 
     const handleMouseUp = (e: MouseEvent) => {
       const point = mapCoords(e.clientX, e.clientY);
       const button = BTN_MAP[e.button] ?? 'left';
-      const modifiers = getModifiers(e);
-      onInput({ type: 'mouseup', x: point.x, y: point.y, button, clickCount: 1, modifiers });
+      onInput({ type: 'mouseup', x: point.x, y: point.y, button, clickCount: 1, modifiers: getModifiers(e) });
     };
 
-    let lastMoveTime = 0;
     const handleMouseMove = (e: MouseEvent) => {
-      if (e.buttons === 0) return;
-      const now = Date.now();
-      if (now - lastMoveTime < 16) return; // ~60fps throttle
-      lastMoveTime = now;
       const point = mapCoords(e.clientX, e.clientY);
-      const modifiers = getModifiers(e);
-      onInput({ type: 'mousemove', x: point.x, y: point.y, modifiers });
+      onInput({ type: 'mousemove', x: point.x, y: point.y, modifiers: getModifiers(e) });
     };
 
     const handleDblClick = (e: MouseEvent) => {
@@ -199,7 +150,6 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
 
     const handleContextMenu = (e: MouseEvent) => { e.preventDefault(); };
 
-    // --- Keyboard ---
     const handleKeyDown = (e: KeyboardEvent) => {
       if (PREVENT_DEFAULT_KEYS.has(e.key)) e.preventDefault();
       const modifiers = getModifiers(e);
@@ -217,51 +167,51 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
       onInput({ type: 'keyup', key: e.key, code: e.code, modifiers, keyCode });
     };
 
-    el.addEventListener('wheel', handleWheel, { passive: false });
-    el.addEventListener('mousedown', handleMouseDown);
-    el.addEventListener('mouseup', handleMouseUp);
-    el.addEventListener('mousemove', handleMouseMove);
-    el.addEventListener('dblclick', handleDblClick);
-    el.addEventListener('contextmenu', handleContextMenu);
-    el.addEventListener('keydown', handleKeyDown);
-    el.addEventListener('keyup', handleKeyUp);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    canvas.addEventListener('mousedown', handleMouseDown);
+    canvas.addEventListener('mouseup', handleMouseUp);
+    canvas.addEventListener('mousemove', handleMouseMove);
+    canvas.addEventListener('dblclick', handleDblClick);
+    canvas.addEventListener('contextmenu', handleContextMenu);
+    canvas.addEventListener('keydown', handleKeyDown);
+    canvas.addEventListener('keyup', handleKeyUp);
 
     return () => {
-      el.removeEventListener('wheel', handleWheel);
-      el.removeEventListener('mousedown', handleMouseDown);
-      el.removeEventListener('mouseup', handleMouseUp);
-      el.removeEventListener('mousemove', handleMouseMove);
-      el.removeEventListener('dblclick', handleDblClick);
-      el.removeEventListener('contextmenu', handleContextMenu);
-      el.removeEventListener('keydown', handleKeyDown);
-      el.removeEventListener('keyup', handleKeyUp);
+      canvas.removeEventListener('wheel', handleWheel);
+      canvas.removeEventListener('mousedown', handleMouseDown);
+      canvas.removeEventListener('mouseup', handleMouseUp);
+      canvas.removeEventListener('mousemove', handleMouseMove);
+      canvas.removeEventListener('dblclick', handleDblClick);
+      canvas.removeEventListener('contextmenu', handleContextMenu);
+      canvas.removeEventListener('keydown', handleKeyDown);
+      canvas.removeEventListener('keyup', handleKeyUp);
     };
   }, [browser.viewport_width, browser.viewport_height, onInput]);
 
-  const msSupported = typeof MediaSource !== 'undefined';
-
   return (
-    <div ref={divRef} className="preview-surface" tabIndex={0}>
-      {msSupported ? (
-        <video
-          ref={videoRef}
-          className="preview-video"
-          muted
-          playsInline
-          style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+    <div className="canvas-wrap" ref={wrapRef}>
+      <canvas
+        ref={canvasRef}
+        className="browser-canvas"
+        width={browser.viewport_width}
+        height={browser.viewport_height}
+        tabIndex={0}
+        onClick={() => canvasRef.current?.focus()}
+      />
+      {ripples.map((r) => (
+        <span
+          key={r.id}
+          className="click-ripple"
+          style={{ left: r.x, top: r.y }}
         />
-      ) : (
-        <div>
-          <strong>Preview unavailable</strong>
-          <span>MediaSource API not supported in this browser.</span>
-        </div>
-      )}
-      {msSupported && !previewSegment && (
+      ))}
+      {!previewSegment && (
         <div className="preview-overlay-hint">
-          <strong>Waiting for video stream…</strong>
-          <span>Agent is starting Chrome and encoding the display.</span>
+          <strong>Waiting for stream…</strong>
+          <span>Agent is starting Chrome screencast.</span>
         </div>
       )}
     </div>
   );
 }
+
