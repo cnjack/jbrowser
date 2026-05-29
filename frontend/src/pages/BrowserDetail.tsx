@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { createCdpToken, getBrowser, listCdpTokens, resetBrowser } from '../api/browser';
+import { Copy, Monitor, Server, Terminal } from 'lucide-react';
+import { getBrowser, resetBrowser } from '../api/browser';
 import { InputOverlay } from '../components/InputOverlay';
+import { Sidebar } from '../components/Sidebar';
 import { TabBar } from '../components/TabBar';
 import { useAuthStore } from '../stores/auth';
 import { ControlSocket } from '../ws/control';
@@ -14,12 +16,13 @@ interface Props {
 export function BrowserDetail({ tenantId, browserId }: Props) {
   const queryClient = useQueryClient();
   const token = useAuthStore((state) => state.token);
-  const [cdpToken, setCdpToken] = useState<string | null>(null);
   const [addressInput, setAddressInput] = useState('');
   const [previewSegment, setPreviewSegment] = useState<ArrayBuffer | null>(null);
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [statusUrl, setStatusUrl] = useState('');
+  const [copied, setCopied] = useState<string | null>(null);
+  const [panelOpen, setPanelOpen] = useState(true);
   const socket = useMemo(() => new ControlSocket(), []);
   const loadingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -28,33 +31,28 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
     queryFn: () => getBrowser(tenantId, browserId),
     refetchInterval: 5_000,
   });
-  const tokenQuery = useQuery({
-    queryKey: ['cdp-tokens', tenantId],
-    queryFn: () => listCdpTokens(tenantId),
-  });
   const resetMutation = useMutation({
     mutationFn: () => resetBrowser(tenantId, browserId),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] }),
   });
-  const cdpMutation = useMutation({
-    mutationFn: () => createCdpToken(tenantId),
-    onSuccess: (result) => {
-      setCdpToken(result.token);
-      queryClient.invalidateQueries({ queryKey: ['cdp-tokens', tenantId] });
-    },
-  });
 
   useEffect(() => {
     if (!token) return;
+    const { logout } = useAuthStore.getState();
     socket.connect(
       token,
       (event) => {
+        if (event.type === 'error') {
+          // Auth error — token likely expired/invalid, redirect to login
+          logout();
+          window.location.href = '/login';
+          return;
+        }
         if (event.type === 'browser.state' || event.type === 'tab.list') {
           queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] });
         }
         if (event.type === 'preview.segment') {
           setPreviewSegment(event.payload);
-          // Clear loading when first frame arrives
           setLoading(false);
           if (loadingTimerRef.current) clearTimeout(loadingTimerRef.current);
         }
@@ -62,16 +60,14 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
       () => setConnected(true),
       () => setConnected(false),
     );
-    const timer = window.setTimeout(() => socket.subscribe(browserId), 250);
+    socket.subscribe(browserId);
     return () => {
-      window.clearTimeout(timer);
       socket.close();
     };
   }, [browserId, queryClient, socket, tenantId, token]);
 
   const browser = browserQuery.data;
 
-  // Sync address bar + status bar with active tab URL
   useEffect(() => {
     const activeTab = browser?.tabs.find((t) => t.active);
     if (activeTab?.url && activeTab.url !== 'about:blank') {
@@ -80,14 +76,9 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
     }
   }, [browser]);
 
-  const cdpUrl = cdpToken
-    ? `${window.location.origin.replace(/^http/, 'ws')}/cdp/tenants/${tenantId}/browser-instances/${browserId}/devtools/page/${browser?.active_tab_id ?? 'target'}?token=${cdpToken}`
-    : null;
-
   const startLoading = useCallback(() => {
     setLoading(true);
     if (loadingTimerRef.current) clearTimeout(loadingTimerRef.current);
-    // Auto-clear loading after 10s as fallback
     loadingTimerRef.current = setTimeout(() => setLoading(false), 10000);
   }, []);
 
@@ -116,56 +107,156 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
     startLoading();
   }
 
+  function copyText(text: string, label: string) {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(label);
+      setTimeout(() => setCopied(null), 2000);
+    });
+  }
+
+  const cdpBase = `${window.location.protocol}//${window.location.host}`;
+  const cdpEndpoint = `${cdpBase}/cdp/tenants/${tenantId}/browser-instances/${browserId}`;
+  const wsEndpoint = `${cdpBase.replace('http', 'ws')}/cdp/tenants/${tenantId}/browser-instances/${browserId}`;
+
   if (!browser) {
-    return <main className="browser-shell"><p style={{ color: '#888', padding: '2rem' }}>Loading browser...</p></main>;
+    return (
+      <div className="app-layout">
+        <Sidebar activePage="browsers" tenantId={tenantId} />
+        <main className="browser-shell"><p style={{ color: 'var(--muted)', padding: '2rem' }}>Loading browser...</p></main>
+      </div>
+    );
   }
 
   return (
-    <main className="browser-shell">
-      {/* Tab strip */}
+    <div className="app-layout">
+      <Sidebar activePage="browsers" tenantId={tenantId} />
+      <main className="browser-shell">
+      {/* Tab strip — Chrome-style */}
       <div className="browser-tabs-strip">
-        <a href={`/tenants/${tenantId}/browsers`} className="back-link" title="Back to browsers">←</a>
         <TabBar
           tabs={browser.tabs}
           onCommand={(payload) => socket.send({ type: 'tab.command', payload: { browserInstanceId: browser.id, ...payload } })}
         />
       </div>
 
-      {/* Toolbar */}
+      {/* Toolbar — Chrome-style omnibox */}
       <div className="browser-toolbar">
-        <button className="icon-btn" title="Back" onClick={handleBack}>&#8592;</button>
-        <button className="icon-btn" title="Forward" onClick={handleForward}>&#8594;</button>
-        <button className="icon-btn" title="Reload" onClick={handleReload}>&#8635;</button>
-        <form className="address-bar" onSubmit={handleNavigate}>
+        <div className="toolbar-nav-group">
+          <button className="icon-btn" title="Back" onClick={handleBack}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <button className="icon-btn" title="Forward" onClick={handleForward}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+          </button>
+          <button className="icon-btn" title="Reload" onClick={handleReload}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 4v6h6" /><path d="M23 20v-6h-6" /><path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" /></svg>
+          </button>
+        </div>
+        <form className="omnibox" onSubmit={handleNavigate}>
+          <div className={`conn-indicator${connected ? ' connected' : ''}`} title={connected ? 'Connected' : 'Disconnected'} />
           <input
             type="text"
-            className="address-input"
+            className="omnibox-input"
             value={addressInput}
             onChange={(e) => setAddressInput(e.target.value)}
-            placeholder="Enter URL and press Enter…"
+            placeholder="Search or enter URL"
             aria-label="Address bar"
           />
-          <button type="submit" className="address-go">Go</button>
         </form>
-        <div className="divider-v" />
-        <button
-          className="icon-btn danger-btn"
-          title="Reset browser"
-          onClick={() => resetMutation.mutate()}
-        >⟳</button>
-        <div className={`conn-dot${connected ? ' connected' : ''}`} title={connected ? 'Connected' : 'Disconnected'} />
+        <div className="toolbar-actions">
+          {!panelOpen && (
+            <button
+              className="icon-btn"
+              title="Show info panel"
+              onClick={() => setPanelOpen(true)}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><line x1="15" y1="3" x2="15" y2="21" /></svg>
+            </button>
+          )}
+          <button
+            className="icon-btn"
+            title="Reset browser"
+            onClick={() => resetMutation.mutate()}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><path d="M15 9l-6 6M9 9l6 6" /></svg>
+          </button>
+        </div>
       </div>
 
       {/* Progress bar */}
       <div className={`progress-bar${loading ? ' active' : ''}`} />
 
       {/* Canvas area */}
-      <div className="browser-canvas-area">
-        <InputOverlay
-          browser={browser}
-          onInput={(payload) => socket.send({ type: 'input.event', payload: { browserInstanceId: browser.id, ...payload } })}
-          previewSegment={previewSegment}
-        />
+      <div className="browser-content-split">
+        <div className="browser-canvas-area">
+          <InputOverlay
+            browser={browser}
+            onInput={(payload) => socket.send({ type: 'input.event', payload: { browserInstanceId: browser.id, ...payload } })}
+            previewSegment={previewSegment}
+          />
+        </div>
+
+        {/* Right info panel */}
+        {panelOpen && (
+          <aside className="browser-info-panel">
+            <div className="info-panel-header">
+              <h3>Browser Info</h3>
+              <button className="icon-btn-sm" title="Close panel" onClick={() => setPanelOpen(false)}>×</button>
+            </div>
+
+            <div className="info-section">
+              <div className="info-label"><Monitor size={13} /> Instance</div>
+              <div className="info-row">
+                <span className="info-key">ID</span>
+                <span className="info-value mono">{browser.id.slice(0, 8)}…</span>
+                <button className="info-copy" title="Copy ID" onClick={() => copyText(browser.id, 'id')}>
+                  <Copy size={11} />{copied === 'id' ? ' ✓' : ''}
+                </button>
+              </div>
+              <div className="info-row">
+                <span className="info-key">Name</span>
+                <span className="info-value">{browser.name}</span>
+              </div>
+              <div className="info-row">
+                <span className="info-key">Status</span>
+                <span className={`info-badge ${browser.status}`}>{browser.status}</span>
+              </div>
+              <div className="info-row">
+                <span className="info-key">Viewport</span>
+                <span className="info-value mono">{browser.viewport_width}×{browser.viewport_height}</span>
+              </div>
+            </div>
+
+            <div className="info-section">
+              <div className="info-label"><Server size={13} /> Agent</div>
+              <div className="info-row">
+                <span className="info-key">Name</span>
+                <span className="info-value">{browser.agent_name || '—'}</span>
+              </div>
+              <div className="info-row">
+                <span className="info-key">Status</span>
+                <span className={`info-badge ${browser.agent_status}`}>{browser.agent_status}</span>
+              </div>
+            </div>
+
+            <div className="info-section">
+              <div className="info-label"><Terminal size={13} /> CDP Endpoint</div>
+              <div className="info-copyblock">
+                <code>{cdpEndpoint}/json/version</code>
+                <button className="info-copy" title="Copy" onClick={() => copyText(`${cdpEndpoint}/json/version`, 'cdp-json')}>
+                  <Copy size={11} />{copied === 'cdp-json' ? ' ✓' : ''}
+                </button>
+              </div>
+              <div className="info-copyblock">
+                <code>{wsEndpoint}/devtools/browser/…</code>
+                <button className="info-copy" title="Copy" onClick={() => copyText(`${wsEndpoint}/devtools/browser/`, 'cdp-ws')}>
+                  <Copy size={11} />{copied === 'cdp-ws' ? ' ✓' : ''}
+                </button>
+              </div>
+              <p className="info-hint">Use a CDP API key in the <code>Authorization</code> header.</p>
+            </div>
+          </aside>
+        )}
       </div>
 
       {/* Status bar */}
@@ -173,15 +264,10 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
         <span className="status-url" title={statusUrl}>{statusUrl || 'about:blank'}</span>
         <span className="status-right">
           {browser.agent_name} · {browser.viewport_width}×{browser.viewport_height}
-          {cdpToken ? (
-            <> · <a href="#" onClick={(e) => { e.preventDefault(); navigator.clipboard.writeText(cdpUrl ?? ''); }}>Copy CDP URL</a></>
-          ) : (
-            <> · <a href="#" onClick={(e) => { e.preventDefault(); cdpMutation.mutate(); }}>Get CDP</a></>
-          )}
-          · {tokenQuery.data?.length ?? 0} tokens
         </span>
       </div>
     </main>
+    </div>
   );
 }
 

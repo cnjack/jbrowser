@@ -6,6 +6,8 @@ export type ControlEvent =
 
 export class ControlSocket {
   private socket: WebSocket | null = null;
+  private authenticated = false;
+  private pendingSubscribe: string | null = null;
 
   connect(
     token: string,
@@ -16,9 +18,9 @@ export class ControlSocket {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     this.socket = new WebSocket(`${protocol}//${window.location.host}/ws/control`);
     this.socket.binaryType = 'arraybuffer';
+    this.authenticated = false;
     this.socket.onopen = () => {
       this.send({ type: 'auth', payload: { token } });
-      onConnected?.();
     };
     this.socket.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
@@ -26,6 +28,21 @@ export class ControlSocket {
         return;
       }
       const message = JSON.parse(event.data as string) as { type: string; payload?: unknown };
+      if (message.type === 'auth.ok') {
+        this.authenticated = true;
+        onConnected?.();
+        // If subscribe was called before auth completed, send it now
+        if (this.pendingSubscribe) {
+          this.send({ type: 'browser.subscribe', payload: { browserInstanceId: this.pendingSubscribe } });
+          this.pendingSubscribe = null;
+        }
+        return;
+      }
+      if (message.type === 'auth.error') {
+        console.error('WS auth failed:', message.payload);
+        onEvent({ type: 'error', payload: message.payload });
+        return;
+      }
       if (
         message.type === 'browser.state' ||
         message.type === 'tab.list' ||
@@ -35,12 +52,18 @@ export class ControlSocket {
       }
     };
     this.socket.onclose = () => {
+      this.authenticated = false;
       onDisconnected?.();
     };
   }
 
   subscribe(browserInstanceId: string) {
-    this.send({ type: 'browser.subscribe', payload: { browserInstanceId } });
+    if (this.authenticated) {
+      this.send({ type: 'browser.subscribe', payload: { browserInstanceId } });
+    } else {
+      // Queue until auth completes
+      this.pendingSubscribe = browserInstanceId;
+    }
   }
 
   send(message: unknown) {
@@ -52,5 +75,7 @@ export class ControlSocket {
   close() {
     this.socket?.close();
     this.socket = null;
+    this.authenticated = false;
+    this.pendingSubscribe = null;
   }
 }

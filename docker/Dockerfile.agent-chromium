@@ -1,6 +1,6 @@
 FROM rust:1.89-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release -p jbrowser-agent
 
@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 10001 jbrowser
 COPY --from=builder /app/target/release/jbrowser-agent /usr/local/bin/jbrowser-agent
+RUN mkdir -p /home/jbrowser/.local/share/jbrowser-agent \
+    && chown -R jbrowser:jbrowser /home/jbrowser/.local
 USER jbrowser
 ENV BROWSER_TYPE=chromium
 ENV BROWSER_VERSION=container

@@ -43,6 +43,7 @@ services:
       REGISTRATION_TOKEN: jbr_reg_dev_seed_token_for_local_docker
       AGENT_NAME: chromium-agent
       RUST_LOG: info,jbrowser_agent=debug
+      DBUS_SESSION_BUS_ADDRESS: /dev/null
     volumes:
       - agent_data:/home/jbrowser/.local/share/jbrowser-agent
     shm_size: "1gb"

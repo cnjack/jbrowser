@@ -1,4 +1,5 @@
 import { FormEvent, useState } from 'react';
+import { Globe } from 'lucide-react';
 import { login } from '../api/browser';
 import { useAuthStore } from '../stores/auth';
 
@@ -25,8 +26,13 @@ export function Login() {
     <main className="auth-shell">
       <section className="auth-left">
         <div className="brand">
-          <span className="brand-mark" />
-          <span className="brand-name">JBrowser</span>
+          <span className="brand-icon"><Globe size={18} strokeWidth={2.2} /></span>
+          <span className="brand-name">
+            <span className="brand-bracket">[</span>
+            <span className="brand-j">J</span>
+            <span className="brand-text">Browser</span>
+            <span className="brand-bracket">]</span>
+          </span>
         </div>
         <h1 className="auth-hero">
           Fleet your <em>browsers</em> at scale.

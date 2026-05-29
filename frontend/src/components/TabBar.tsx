@@ -19,11 +19,12 @@ export function TabBar({ tabs, onCommand }: Props) {
           key={tab.id}
           onClick={() => onCommand({ command: 'activate', tabId: tab.id })}
           type="button"
+          title={tab.url || tab.title}
         >
           {tab.favicon_url && (
-            <img src={tab.favicon_url} alt="" width={14} height={14} style={{ flexShrink: 0 }} />
+            <img src={tab.favicon_url} alt="" width={14} height={14} className="tab-favicon" />
           )}
-          <span className="tab-title">{tab.title || tab.url || tab.id}</span>
+          <span className="tab-title">{tab.title || tab.url || 'New Tab'}</span>
           <span
             className="tab-close"
             onClick={(e) => { e.stopPropagation(); onCommand({ command: 'close', tabId: tab.id }); }}
@@ -32,8 +33,13 @@ export function TabBar({ tabs, onCommand }: Props) {
           </span>
         </button>
       ))}
-      <button type="button" onClick={() => onCommand({ command: 'open', url: 'about:blank' })}>
-        + New tab
+      <button
+        className="tab-new"
+        type="button"
+        onClick={() => onCommand({ command: 'open', url: 'about:blank' })}
+        title="New tab"
+      >
+        +
       </button>
     </div>
   );

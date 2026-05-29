@@ -11,10 +11,11 @@ use jbrowser_shared::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 use tokio::{
     fs,
     process::{Child, Command},
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, Mutex},
     time::interval,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -50,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Broadcast channel: screencast reader → all active WS connections.
     let (video_tx, _) = broadcast::channel::<Bytes>(128);
+    // Last frame cache: screencast stores the latest frame for immediate delivery
+    let last_frame: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
 
     // Persistent input channel: all input/navigate commands go through here
     // to avoid creating a new CDP WS connection per event.
@@ -58,9 +61,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(input_loop(input_chan_rx));
 
     // Start CDP screencast task
-    tokio::spawn(screencast_loop(video_tx.clone()));
+    tokio::spawn(screencast_loop(video_tx.clone(), last_frame.clone()));
 
-    connect_loop(config, identity, video_tx).await
+    connect_loop(config, identity, video_tx, last_frame).await
 }
 
 // ── Config / identity ────────────────────────────────────────────────────────
@@ -158,6 +161,10 @@ async fn start_chrome() -> anyhow::Result<Child> {
             "--disable-background-networking",
             "--disable-client-side-phishing-detection",
             "--disable-sync",
+            "--disable-features=GCMDriver",
+            "--disable-notifications",
+            "--no-service-autorun",
+            "--password-store=basic",
             "about:blank",
         ])
         .spawn()
@@ -187,16 +194,16 @@ async fn start_chrome() -> anyhow::Result<Child> {
 
 /// Connects to Chrome CDP, starts Page.startScreencast, and broadcasts
 /// JPEG frames to all connected WS clients.
-async fn screencast_loop(video_tx: broadcast::Sender<Bytes>) {
+async fn screencast_loop(video_tx: broadcast::Sender<Bytes>, last_frame: Arc<Mutex<Option<Bytes>>>) {
     loop {
-        if let Err(e) = run_screencast(&video_tx).await {
+        if let Err(e) = run_screencast(&video_tx, &last_frame).await {
             warn!("screencast error: {e}");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn run_screencast(video_tx: &broadcast::Sender<Bytes>) -> anyhow::Result<()> {
+async fn run_screencast(video_tx: &broadcast::Sender<Bytes>, last_frame: &Arc<Mutex<Option<Bytes>>>) -> anyhow::Result<()> {
     let target = ensure_page_target().await?;
     let ws_url = target["webSocketDebuggerUrl"]
         .as_str()
@@ -249,9 +256,10 @@ async fn run_screencast(video_tx: &broadcast::Sender<Bytes>) -> anyhow::Result<(
                             payload: Bytes::from(jpeg_bytes),
                         });
                         sequence += 1;
-                        if video_tx.receiver_count() > 0 {
-                            let _ = video_tx.send(encoded);
-                        }
+                        // Always send — drops are fine when no subscribers
+                        let _ = video_tx.send(encoded.clone());
+                        // Cache for instant delivery on reconnect
+                        *last_frame.lock().await = Some(encoded);
                     }
 
                     // Acknowledge the frame
@@ -692,9 +700,10 @@ async fn connect_loop(
     config: AgentConfig,
     mut identity: AgentIdentity,
     video_tx: broadcast::Sender<Bytes>,
+    last_frame: Arc<Mutex<Option<Bytes>>>,
 ) -> anyhow::Result<()> {
     loop {
-        match connect_once(&config, &identity, video_tx.clone()).await {
+        match connect_once(&config, &identity, video_tx.clone(), last_frame.clone()).await {
             Ok(()) => warn!("agent websocket disconnected"),
             Err(err) => {
                 let msg = err.to_string();
@@ -723,6 +732,7 @@ async fn connect_once(
     config: &AgentConfig,
     identity: &AgentIdentity,
     video_tx: broadcast::Sender<Bytes>,
+    _last_frame: Arc<Mutex<Option<Bytes>>>,
 ) -> anyhow::Result<()> {
     let request = http_request_with_bearer(
         &format!("{}/api/v1/agents/connect", config.control_ws_url),

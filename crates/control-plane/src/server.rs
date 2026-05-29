@@ -11,7 +11,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, delete},
+    routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -84,6 +84,8 @@ pub struct AppState {
     agent_senders: Arc<RwLock<HashMap<Uuid, mpsc::Sender<String>>>>,
     /// Per-browser video broadcast: browser_id → broadcast::Sender<Vec<u8>>
     browser_preview: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Vec<u8>>>>>,
+    /// Per-browser last video frame cache for immediate delivery on subscribe
+    browser_last_frame: Arc<RwLock<HashMap<Uuid, Vec<u8>>>>,
     /// Per-browser event broadcast: browser_id → broadcast::Sender<String (JSON)>
     browser_events: Arc<RwLock<HashMap<Uuid, broadcast::Sender<String>>>>,
 }
@@ -98,6 +100,7 @@ impl AppState {
             preview_tx,
             agent_senders: Arc::new(RwLock::new(HashMap::new())),
             browser_preview: Arc::new(RwLock::new(HashMap::new())),
+            browser_last_frame: Arc::new(RwLock::new(HashMap::new())),
             browser_events: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -244,7 +247,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tenants/:tenant_id/agent-registration-tokens",
-            post(create_agent_registration_token),
+            get(list_agent_registration_tokens).post(create_agent_registration_token),
         )
         .route(
             "/api/v1/tenants/:tenant_id/agent-registration-tokens/:token_id/revoke",
@@ -542,6 +545,24 @@ async fn list_cdp_tokens(
     Ok(Json(json!({ "data": data })))
 }
 
+async fn list_agent_registration_tokens(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    authorize(&state, &headers, Some(tenant_id)).await?;
+    let store = state.store.read().await;
+    let data = store
+        .tokens
+        .values()
+        .filter(|token| {
+            token.tenant_id == tenant_id && token.token_type == TokenType::AgentRegistration
+        })
+        .map(TokenResponse::from)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "data": data })))
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateTokenRequest {
     name: Option<String>,
@@ -818,7 +839,7 @@ async fn handle_agent_socket(
     state: AppState,
     tenant_id: Uuid,
     agent_id_hint: Option<Uuid>,
-    mut socket: WebSocket,
+    socket: WebSocket,
 ) {
     info!(%tenant_id, "agent websocket connected");
 
@@ -874,8 +895,12 @@ async fn handle_agent_socket(
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(_frame) = decode_video_frame(bytes.clone().into()) {
+                            let subs = bcast_tx.receiver_count();
                             let _ = bcast_tx.send(bytes.clone());
-                            let _ = state.preview_tx.send(bytes);
+                            let _ = state.preview_tx.send(bytes.clone());
+                            // Cache last frame for immediate delivery on subscribe
+                            state.browser_last_frame.write().await.insert(browser_id, bytes);
+                            tracing::debug!(seq = _frame.sequence, subs, "video frame relayed");
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -894,6 +919,7 @@ async fn handle_agent_socket(
     // Cleanup on disconnect
     state.agent_senders.write().await.remove(&agent_id);
     state.browser_preview.write().await.remove(&browser_id);
+    state.browser_last_frame.write().await.remove(&browser_id);
     state.browser_events.write().await.remove(&browser_id);
     let mut store = state.store.write().await;
     if let Some(a) = store.agents.get_mut(&agent_id) {
@@ -937,6 +963,7 @@ async fn ws_control(State(state): State<AppState>, ws: WebSocketUpgrade) -> Resp
 }
 
 async fn handle_control_socket(state: AppState, socket: WebSocket) {
+    tracing::debug!("control WS connection opened");
     let (mut sender, mut receiver) = socket.split();
     let auth_timeout = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(auth_timeout);
@@ -959,6 +986,7 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                                 match decode_jwt(&state.config.jwt_secret, token) {
                                     Ok(claims) => {
                                         let _ = send_json(&mut sender, ServerMessage::new("auth.ok", json!({}))).await;
+                                        tracing::debug!(sub = %claims.sub, "control WS authenticated");
                                         break claims;
                                     }
                                     Err(_) => {
@@ -1017,6 +1045,7 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                     // Check if this is a browser.subscribe to update preview channel
                     if let Ok(parsed) = serde_json::from_str::<ClientMessage>(&text) {
                         if parsed.kind == "browser.subscribe" {
+                            tracing::debug!(payload = %parsed.payload, "browser.subscribe received");
                             if let Some(bid) = parsed.payload.get("browserInstanceId")
                                 .and_then(Value::as_str)
                                 .and_then(|id| Uuid::parse_str(id).ok())
@@ -1024,10 +1053,17 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                                 current_browser_id = Some(bid);
                                 // Subscribe to per-browser preview channel if available
                                 let map = state.browser_preview.read().await;
+                                let found = map.contains_key(&bid);
+                                tracing::debug!(%bid, found, keys = ?map.keys().collect::<Vec<_>>(), "control client subscribing to browser preview");
                                 preview_rx = map.get(&bid).map(|tx| tx.subscribe());
                                 // Subscribe to per-browser event channel
                                 let ev_map = state.browser_events.read().await;
                                 events_rx = ev_map.get(&bid).map(|tx| tx.subscribe());
+                                // Send cached last frame immediately so client doesn't wait
+                                let last = state.browser_last_frame.read().await;
+                                if let Some(frame) = last.get(&bid) {
+                                    let _ = sender.send(Message::Binary(frame.clone())).await;
+                                }
                             }
                         }
                     }

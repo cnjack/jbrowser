@@ -31,6 +31,19 @@ export interface BrowserInstance {
   last_heartbeat_at?: string | null;
 }
 
+export interface Agent {
+  id: string;
+  tenant_id: string;
+  name: string;
+  status: 'online' | 'offline' | 'unhealthy';
+  browser_instance_id: string;
+  browser_type: string;
+  browser_version: string;
+  connected_at: string | null;
+  last_heartbeat_at: string | null;
+  ip_address?: string | null;
+}
+
 export interface TokenRecord {
   id: string;
   tenant_id: string;

@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>JBrowser — Design System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,400;0,600;0,700;0,800;1,800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:'Inter',system-ui,sans-serif;
+  font-size:14px;color:#15140f;background:#efe7d2;
+  -webkit-font-smoothing:antialiased;
+}
+
+/* --- Variables --- */
+:root{
+  --bg:#efe7d2;--surface:#f7f1de;--surface-warm:#ece4cf;--surface-dark:#ddd2b6;
+  --fg:#15140f;--fg-2:#2a2620;--muted:#5a5448;--meta:#8b8676;
+  --border:rgba(21,20,15,0.12);--border-soft:rgba(21,20,15,0.07);
+  --accent:#ed6f5c;--accent-on:#fff;--accent-soft:#f08e7c;
+  --success:#2d6a4f;--warn:#b47d1e;--danger:#b5341a;
+  --shadow-card:0 1px 3px rgba(21,20,15,0.06),0 0 0 1px rgba(21,20,15,0.08);
+  --shadow-raised:0 4px 16px rgba(21,20,15,0.10),0 0 0 1px rgba(21,20,15,0.08);
+  --ease:cubic-bezier(0.2,0,0,1);
+}
+
+/* --- Layout --- */
+.page{max-width:960px;margin:0 auto;padding:80px 32px 120px}
+
+/* --- Section --- */
+.section{margin-bottom:80px}
+.section-num{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;
+  color:var(--meta);margin-bottom:8px;
+}
+.section-title{
+  font-family:'Inter Tight',system-ui,sans-serif;
+  font-size:11px;font-weight:600;letter-spacing:0.22em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:32px;
+}
+
+/* --- Hero Header --- */
+.hero{text-align:center;margin-bottom:96px;padding-top:40px}
+.hero-brand{
+  display:inline-flex;align-items:center;gap:11px;margin-bottom:32px;
+}
+.brand-mark{width:16px;height:16px;background:var(--accent);border-radius:4px}
+.brand-name{font-family:'Inter Tight',sans-serif;font-size:18px;font-weight:700;line-height:1}
+.brand-name .bracket{color:var(--meta)}
+.brand-name .j{color:var(--accent)}
+.brand-name .browser{color:var(--fg)}
+.hero h1{
+  font-family:'Inter Tight',sans-serif;
+  font-size:clamp(36px,6vw,64px);font-weight:800;line-height:1.04;
+  letter-spacing:-0.035em;color:var(--fg);margin-bottom:16px;
+}
+.hero h1 em{font-style:italic;color:var(--accent)}
+.hero p{
+  font-size:14px;line-height:1.6;color:var(--muted);max-width:480px;margin:0 auto;
+}
+
+/* --- Palette --- */
+.palette-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;
+}
+.swatch{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  overflow:hidden;cursor:pointer;transition:transform 150ms var(--ease),box-shadow 150ms var(--ease);
+}
+.swatch:hover{transform:translateY(-2px);box-shadow:var(--shadow-raised)}
+.swatch-color{height:64px;position:relative}
+.swatch-info{padding:10px 12px}
+.swatch-hex{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;color:var(--fg-2);
+}
+.swatch-name{font-size:11px;color:var(--meta);margin-top:2px}
+.swatch .copied{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-family:'Inter Tight',sans-serif;font-size:11px;font-weight:600;
+  letter-spacing:0.1em;text-transform:uppercase;color:#fff;
+  background:rgba(0,0,0,0.5);opacity:0;transition:opacity 200ms;pointer-events:none;
+}
+.swatch.show-copied .copied{opacity:1}
+
+/* Dark swatches — removed, unified light theme */
+
+/* --- Typography --- */
+.type-stack{display:flex;flex-direction:column;gap:24px}
+.type-row{
+  display:flex;align-items:baseline;gap:24px;
+  padding:20px 24px;background:var(--surface);border:1px solid var(--border);border-radius:12px;
+}
+.type-sample{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.type-meta{
+  flex-shrink:0;text-align:right;
+  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--meta);
+  white-space:nowrap;
+}
+
+/* --- Spacing --- */
+.spacing-row{display:flex;align-items:center;gap:16px;margin-bottom:8px}
+.spacing-bar{height:24px;background:color-mix(in oklab,var(--accent) 18%,var(--surface));border:1px solid color-mix(in oklab,var(--accent) 30%,transparent);border-radius:4px}
+.spacing-label{
+  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);
+  min-width:56px;
+}
+.spacing-value{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--meta)}
+
+.radius-row{display:flex;gap:16px;flex-wrap:wrap;margin-top:32px}
+.radius-item{
+  display:flex;flex-direction:column;align-items:center;gap:8px;
+}
+.radius-box{
+  width:56px;height:56px;background:var(--surface);
+  border:2px solid var(--accent);
+}
+.radius-label{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--meta)}
+
+/* --- Components --- */
+.comp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px}
+.comp-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:24px;display:flex;flex-direction:column;gap:16px;
+}
+.comp-label{
+  font-family:'Inter Tight',sans-serif;font-size:11px;font-weight:600;
+  letter-spacing:0.18em;text-transform:uppercase;color:var(--meta);
+}
+
+/* Buttons */
+.btn-primary{
+  display:inline-flex;align-items:center;justify-content:center;
+  background:var(--accent);color:var(--accent-on);border:none;
+  font-family:'Inter Tight',sans-serif;font-size:13px;font-weight:700;
+  padding:12px 18px;border-radius:9999px;
+  transition:transform 150ms var(--ease),background 150ms var(--ease);
+}
+.btn-primary:hover{transform:translateY(-1px);background:var(--accent-soft)}
+.btn-create{padding:8px 18px}
+
+/* Input */
+.input-field{
+  width:100%;background:var(--surface);color:var(--fg);
+  border:1px solid var(--border);border-radius:8px;padding:12px 14px;
+  font-size:14px;outline:none;
+  transition:border-color 150ms var(--ease),box-shadow 150ms var(--ease);
+}
+.input-field:focus{
+  border-color:color-mix(in oklab,var(--accent) 45%,var(--border));
+  box-shadow:0 0 0 3px color-mix(in oklab,var(--accent) 12%,transparent);
+}
+
+/* Status badges */
+.badge{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:4px 10px;border-radius:9999px;
+  font-family:'Inter Tight',sans-serif;font-size:11px;font-weight:600;
+  letter-spacing:0.22em;text-transform:uppercase;
+}
+.badge::before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor}
+.badge-online{
+  color:var(--success);
+  background:color-mix(in oklab,var(--success) 12%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--success) 25%,transparent);
+}
+.badge-offline{
+  color:var(--muted);
+  background:color-mix(in oklab,var(--muted) 10%,var(--surface));
+  border:1px solid var(--border);
+}
+.badge-restarting{
+  color:var(--warn);
+  background:color-mix(in oklab,var(--warn) 12%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--warn) 25%,transparent);
+}
+.badge-online::before{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* Nav item */
+.nav-item{
+  display:flex;align-items:center;gap:10px;height:36px;padding:0 8px;
+  border-radius:8px;font-size:13px;font-weight:500;color:var(--muted);
+  transition:all 150ms var(--ease);cursor:pointer;
+}
+.nav-item:hover{color:var(--fg);background:rgba(21,20,15,0.04)}
+.nav-item.active{color:var(--accent);background:color-mix(in oklab,var(--accent) 12%,var(--surface-warm))}
+.nav-icon{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+/* Filter tabs */
+.filter-tabs{display:flex;gap:20px;border-bottom:1px solid var(--border)}
+.filter-tab{
+  padding:8px 0;border:none;background:none;
+  border-bottom:2px solid transparent;
+  font-family:'Inter Tight',sans-serif;font-size:13px;font-weight:700;
+  color:var(--meta);cursor:pointer;transition:all 150ms var(--ease);
+}
+.filter-tab:hover{color:var(--fg)}
+.filter-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+
+/* Browser card */
+.browser-card-demo{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:20px;box-shadow:var(--shadow-card);
+  transition:transform 150ms var(--ease),box-shadow 150ms var(--ease),border-color 150ms var(--ease);
+}
+.browser-card-demo:hover{
+  transform:translateY(-2px);box-shadow:var(--shadow-raised);
+  border-color:color-mix(in oklab,var(--accent) 30%,var(--border));
+}
+.card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.card-name{font-family:'Inter Tight',sans-serif;font-size:15px;font-weight:600}
+.card-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.metric{display:flex;flex-direction:column;gap:2px}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--meta)}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;color:var(--fg-2)}
+
+/* Error msg */
+.error-msg{
+  background:color-mix(in oklab,var(--danger) 8%,var(--surface));
+  color:var(--danger);border:1px solid color-mix(in oklab,var(--danger) 18%,var(--border));
+  border-radius:8px;padding:11px 13px;font-size:13px;font-weight:500;
+}
+
+/* --- Browser Detail Section --- */
+.browser-detail-section{
+  background:var(--surface-warm);border-radius:16px;padding:32px;
+  margin-top:12px;
+}
+.browser-detail-section .comp-card{
+  background:var(--surface);border-color:var(--border);
+}
+.browser-detail-section .comp-label{color:var(--meta)}
+
+/* Dark tab strip — now light */
+.tab-strip{display:flex;gap:2px;align-items:flex-end}
+.tab{
+  padding:8px 14px;border-radius:8px 8px 0 0;
+  font-family:'Inter Tight',sans-serif;font-size:12px;font-weight:500;
+  color:var(--muted);background:var(--surface-dark);cursor:pointer;
+  max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.tab.active{color:var(--fg);background:var(--bg)}
+
+/* Dark toolbar — now light */
+.toolbar-demo{
+  display:flex;align-items:center;gap:8px;padding:6px 12px;
+  background:var(--bg);border:1px solid var(--border);border-radius:8px;
+}
+.toolbar-btn{
+  background:transparent;border:none;color:var(--muted);
+  padding:4px 7px;border-radius:6px;font-size:14px;cursor:pointer;
+  transition:all 150ms var(--ease);
+}
+.toolbar-btn:hover{background:rgba(21,20,15,0.06);color:var(--fg)}
+.address-bar{
+  flex:1;background:var(--surface);border:1px solid var(--border);border-radius:20px;
+  padding:6px 14px;color:var(--fg);
+  font-family:'Inter',sans-serif;font-size:13px;outline:none;
+  transition:border-color 150ms var(--ease);
+}
+.address-bar:focus{border-color:var(--accent)}
+.conn-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;transition:background 300ms}
+.conn-dot.connected{background:var(--success)}
+.conn-dot.disconnected{background:var(--meta)}
+
+/* Dark status bar — now light */
+.status-bar-demo{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:3px 12px;background:var(--surface-warm);
+  border:1px solid var(--border);border-radius:6px;
+  font-size:12px;color:var(--meta);
+}
+.status-bar-demo a{color:var(--accent)}
+
+/* Progress bar */
+.progress-track{height:2px;background:transparent;border-radius:1px;overflow:hidden;margin:4px 0}
+.progress-bar{height:100%;width:30%;background:var(--accent);border-radius:1px;animation:slide 1.4s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}
+
+/* --- Motion --- */
+.motion-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}
+.motion-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:20px;text-align:center;
+}
+.motion-card .comp-label{margin-bottom:12px}
+.motion-viz{
+  height:40px;display:flex;align-items:center;justify-content:center;margin-bottom:12px;
+}
+.motion-dot{
+  width:12px;height:12px;border-radius:50%;background:var(--accent);
+}
+.motion-card:nth-child(1) .motion-dot{animation:motionBase 1.6s var(--ease) infinite alternate}
+.motion-card:nth-child(2) .motion-dot{animation:motionFast 1s var(--ease) infinite alternate}
+.motion-card:nth-child(3) .motion-dot{animation:motionPulse 1.4s ease-in-out infinite}
+@keyframes motionBase{0%{transform:translateX(-40px)}100%{transform:translateX(40px)}}
+@keyframes motionFast{0%{transform:translateX(-40px)}100%{transform:translateX(40px)}}
+@keyframes motionPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.7)}}
+.motion-timing{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--meta)}
+
+/* --- Footer --- */
+.footer{
+  text-align:center;padding-top:40px;border-top:1px solid var(--border);
+  font-size:12px;color:var(--meta);
+}
+.footer span{color:var(--accent)}
+
+/* --- Responsive --- */
+@media(max-width:640px){
+  .page{padding:40px 16px 80px}
+  .palette-grid{grid-template-columns:repeat(auto-fill,minmax(110px,1fr))}
+  .comp-grid{grid-template-columns:1fr}
+  .type-row{flex-direction:column;gap:8px}
+  .type-meta{text-align:left}
+}
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="hero-brand">
+      <div class="brand-mark"></div>
+      <div class="brand-name"><span class="bracket">[</span><span class="j">J</span><span class="bracket">]</span><span class="browser">BROWSER</span></div>
+    </div>
+    <h1>The design system<br>behind <em>JBrowser.</em></h1>
+    <p>A living DESIGN.md, rendered. Every swatch copies its CSS variable. Every component is the real component.</p>
+  </div>
+
+  <!-- 01 Palette -->
+  <div class="section">
+    <div class="section-num">01</div>
+    <div class="section-title">Palette</div>
+    <div class="palette-grid" id="light-palette"></div>
+  </div>
+
+  <!-- 02 Typography -->
+  <div class="section">
+    <div class="section-num">02</div>
+    <div class="section-title">Typography</div>
+    <div class="type-stack">
+      <div class="type-row">
+        <div class="type-sample" style="font-family:'Inter Tight',sans-serif;font-size:clamp(36px,6vw,56px);font-weight:800;line-height:0.94;letter-spacing:-0.025em">Fleet your browsers.</div>
+        <div class="type-meta">.hero-display<br>clamp(48–88px) / 800</div>
+      </div>
+      <div class="type-row">
+        <div class="type-sample" style="font-family:'Inter Tight',sans-serif;font-size:clamp(24px,3vw,34px);font-weight:800;line-height:1.1;letter-spacing:-0.025em">Browser Instances</div>
+        <div class="type-meta">.heading-1<br>30–40px / 800</div>
+      </div>
+      <div class="type-row">
+        <div class="type-sample" style="font-family:'Inter Tight',sans-serif;font-size:15px;font-weight:600;line-height:1.3">chrome-session-prod-01</div>
+        <div class="type-meta">.heading-3<br>15px / 600</div>
+      </div>
+      <div class="type-row">
+        <div class="type-sample" style="font-family:'Inter Tight',sans-serif;font-size:11px;font-weight:600;letter-spacing:0.22em;text-transform:uppercase;color:var(--accent)">Control Plane</div>
+        <div class="type-meta">.eyebrow<br>11px / 600 / 0.22em</div>
+      </div>
+      <div class="type-row">
+        <div class="type-sample" style="font-size:14px;font-weight:400;line-height:1.55">Remote browser fleet management with a warm editorial aesthetic. Parchment canvas, single coral-red accent, Inter Tight display type.</div>
+        <div class="type-meta">.body-md<br>14px / 400</div>
+      </div>
+      <div class="type-row">
+        <div class="type-sample" style="font-family:'Inter Tight',sans-serif;font-size:11px;font-weight:600;letter-spacing:0.22em;text-transform:uppercase;color:var(--success)">Online</div>
+        <div class="type-meta">.caption-bold<br>11px / 600 / caps</div>
+      </div>
+      <div class="type-row">
+        <div class="type-sample" style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:500;color:var(--muted)">v0.1.0-alpha · tenant_acme · 2026-05-29</div>
+        <div class="type-meta">.mono<br>JetBrains Mono / 12px</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 03 Spacing & Radius -->
+  <div class="section">
+    <div class="section-num">03</div>
+    <div class="section-title">Spacing &amp; Radius</div>
+    <div id="spacing-bars"></div>
+    <div class="radius-row" id="radius-row"></div>
+  </div>
+
+  <!-- 04 Components · Light -->
+  <div class="section">
+    <div class="section-num">04</div>
+    <div class="section-title">Components</div>
+    <div class="comp-grid">
+
+      <!-- Buttons -->
+      <div class="comp-card">
+        <div class="comp-label">Button · Primary</div>
+        <button class="btn-primary">Create Browser</button>
+        <button class="btn-primary btn-create" style="padding:8px 18px;font-size:12px">+ Create</button>
+      </div>
+
+      <!-- Input -->
+      <div class="comp-card">
+        <div class="comp-label">Input · Field</div>
+        <input class="input-field" type="text" placeholder="Email address" />
+        <input class="input-field" type="password" placeholder="Password" style="margin-top:8px" />
+      </div>
+
+      <!-- Status Badges -->
+      <div class="comp-card">
+        <div class="comp-label">Status · Badges</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <span class="badge badge-online">Online</span>
+          <span class="badge badge-offline">Offline</span>
+          <span class="badge badge-restarting">Restarting</span>
+        </div>
+      </div>
+
+      <!-- Nav Items -->
+      <div class="comp-card">
+        <div class="comp-label">Nav · Sidebar</div>
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div class="nav-item active">
+            <svg class="nav-icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+            Browsers
+          </div>
+          <div class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 1v4m0 14v4m-9-9h4m14 0h4"/></svg>
+            Settings
+          </div>
+        </div>
+      </div>
+
+      <!-- Filter Tabs -->
+      <div class="comp-card">
+        <div class="comp-label">Filter · Tabs</div>
+        <div class="filter-tabs">
+          <button class="filter-tab active">All</button>
+          <button class="filter-tab">Online</button>
+          <button class="filter-tab">Offline</button>
+        </div>
+      </div>
+
+      <!-- Error Message -->
+      <div class="comp-card">
+        <div class="comp-label">Error · Message</div>
+        <div class="error-msg">Invalid email or password. Please try again.</div>
+      </div>
+
+      <!-- Browser Card -->
+      <div class="comp-card" style="grid-column:span 2">
+        <div class="comp-label">Card · Browser Instance</div>
+        <div class="browser-card-demo">
+          <div class="card-top">
+            <span class="card-name">chrome-session-prod-01</span>
+            <span class="badge badge-online">Online</span>
+          </div>
+          <div class="card-metrics">
+            <div class="metric"><span class="metric-label">CPU</span><span class="metric-value">23%</span></div>
+            <div class="metric"><span class="metric-label">MEM</span><span class="metric-value">512 MB</span></div>
+            <div class="metric"><span class="metric-label">UPTIME</span><span class="metric-value">4d 12h</span></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- 05 Components · Browser Detail -->
+  <div class="section">
+    <div class="section-num">05</div>
+    <div class="section-title">Browser Detail</div>
+    <div class="browser-detail-section">
+      <div class="comp-grid">
+
+        <!-- Tab Strip -->
+        <div class="comp-card" style="grid-column:span 2">
+          <div class="comp-label">Tab Strip</div>
+          <div class="tab-strip">
+            <div class="tab active">google.com</div>
+            <div class="tab">GitHub — Where th…</div>
+            <div class="tab">New Tab</div>
+          </div>
+        </div>
+
+        <!-- Toolbar -->
+        <div class="comp-card" style="grid-column:span 2">
+          <div class="comp-label">Toolbar</div>
+          <div class="toolbar-demo">
+            <button class="toolbar-btn">←</button>
+            <button class="toolbar-btn">→</button>
+            <button class="toolbar-btn">↻</button>
+            <input class="address-bar" value="https://google.com" />
+            <div class="conn-dot connected"></div>
+          </div>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="comp-card" style="grid-column:span 2">
+          <div class="comp-label">Progress Bar</div>
+          <div class="progress-track"><div class="progress-bar"></div></div>
+        </div>
+
+        <!-- Status Bar -->
+        <div class="comp-card" style="grid-column:span 2">
+          <div class="comp-label">Status Bar</div>
+          <div class="status-bar-demo">
+            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">https://google.com/search?q=jbrowser</span>
+            <span>agent-01 · <a href="#">CDP</a></span>
+          </div>
+        </div>
+
+        <!-- Connection Dots -->
+        <div class="comp-card">
+          <div class="comp-label">Connection · Dot</div>
+          <div style="display:flex;gap:16px;align-items:center">
+            <div style="display:flex;align-items:center;gap:6px"><div class="conn-dot connected"></div><span style="font-size:12px;color:var(--fg)">Connected</span></div>
+            <div style="display:flex;align-items:center;gap:6px"><div class="conn-dot disconnected"></div><span style="font-size:12px;color:var(--muted)">Disconnected</span></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- 06 Elevation -->
+  <div class="section">
+    <div class="section-num">06</div>
+    <div class="section-title">Elevation</div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap">
+      <div style="width:200px;height:100px;background:var(--surface);border-radius:12px;box-shadow:var(--shadow-card);display:flex;align-items:center;justify-content:center">
+        <span class="comp-label">Card</span>
+      </div>
+      <div style="width:200px;height:100px;background:var(--surface);border-radius:18px;box-shadow:var(--shadow-raised);display:flex;align-items:center;justify-content:center">
+        <span class="comp-label">Raised</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 07 Motion -->
+  <div class="section">
+    <div class="section-num">07</div>
+    <div class="section-title">Motion</div>
+    <div class="motion-grid">
+      <div class="motion-card">
+        <div class="comp-label">Base</div>
+        <div class="motion-viz"><div class="motion-dot"></div></div>
+        <div class="motion-timing">240ms · cubic-bezier(0.2, 0, 0, 1)</div>
+      </div>
+      <div class="motion-card">
+        <div class="comp-label">Fast</div>
+        <div class="motion-viz"><div class="motion-dot"></div></div>
+        <div class="motion-timing">150ms · cubic-bezier(0.2, 0, 0, 1)</div>
+      </div>
+      <div class="motion-card">
+        <div class="comp-label">Pulse</div>
+        <div class="motion-viz"><div class="motion-dot"></div></div>
+        <div class="motion-timing">1.4s · ease-in-out · loop</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span>·</span> DESIGN.md, rendered
+  </div>
+
+</div>
+
+<script>
+// Palette data
+const lightColors = [
+  {name:'Background', var:'--bg', hex:'#efe7d2'},
+  {name:'Surface', var:'--surface', hex:'#f7f1de'},
+  {name:'Surface Warm', var:'--surface-warm', hex:'#ece4cf'},
+  {name:'Surface Dark', var:'--surface-dark', hex:'#ddd2b6'},
+  {name:'Foreground', var:'--fg', hex:'#15140f'},
+  {name:'Foreground 2', var:'--fg-2', hex:'#2a2620'},
+  {name:'Muted', var:'--muted', hex:'#5a5448'},
+  {name:'Meta', var:'--meta', hex:'#8b8676'},
+  {name:'Accent', var:'--accent', hex:'#ed6f5c'},
+  {name:'Accent Soft', var:'--accent-soft', hex:'#f08e7c'},
+  {name:'Success', var:'--success', hex:'#2d6a4f'},
+  {name:'Warning', var:'--warn', hex:'#b47d1e'},
+  {name:'Danger', var:'--danger', hex:'#b5341a'},
+];
+
+function renderPalette(colors, containerId) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = colors.map(c => `
+    <div class="swatch" onclick="copySwatch(this,'${c.var}')">
+      <div class="swatch-color" style="background:${c.hex}">
+        <div class="copied">Copied</div>
+      </div>
+      <div class="swatch-info">
+        <div class="swatch-hex">${c.hex}</div>
+        <div class="swatch-name">${c.name}<br><code style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--meta)">${c.var}</code></div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function copySwatch(el, varName) {
+  navigator.clipboard.writeText('var(' + varName + ')');
+  el.classList.add('show-copied');
+  setTimeout(() => el.classList.remove('show-copied'), 800);
+}
+
+renderPalette(lightColors, 'light-palette');
+
+// Spacing bars
+const spacings = [
+  {name:'xs', value:4}, {name:'sm', value:8}, {name:'md', value:12},
+  {name:'lg', value:16}, {name:'xl', value:20}, {name:'xxl', value:24},
+  {name:'xxxl', value:32},
+];
+document.getElementById('spacing-bars').innerHTML = spacings.map(s => `
+  <div class="spacing-row">
+    <div class="spacing-label">${s.name}</div>
+    <div class="spacing-bar" style="width:${s.value * 4}px"></div>
+    <div class="spacing-value">${s.value}px</div>
+  </div>
+`).join('');
+
+// Radius
+const radii = [
+  {name:'sm', value:'4px'}, {name:'md', value:'8px'}, {name:'lg', value:'12px'},
+  {name:'xl', value:'18px'}, {name:'pill', value:'9999px'},
+];
+document.getElementById('radius-row').innerHTML = radii.map(r => `
+  <div class="radius-item">
+    <div class="radius-box" style="border-radius:${r.value}"></div>
+    <div class="radius-label">${r.name}</div>
+  </div>
+`).join('');
+</script>
+
+</body>
+</html>

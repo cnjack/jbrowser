@@ -1,12 +1,13 @@
 FROM rust:1.89-bookworm AS rust-builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release -p jbrowser-control-plane
 
 FROM node:22-bookworm AS frontend-builder
 WORKDIR /app
 COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY Cargo.lock ./
 COPY frontend/package.json ./frontend/
 RUN corepack enable && pnpm install --frozen-lockfile=false --filter ./frontend
 COPY frontend ./frontend
