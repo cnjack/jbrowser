@@ -52,69 +52,96 @@ const PREVENT_DEFAULT_KEYS = new Set([
   'Backspace', ' ', 'F1', 'F3', 'F5', 'F6',
 ]);
 
+// Try each codec string in order until one is supported.
+const CODEC_CANDIDATES = [
+  'video/mp4; codecs="avc1.42E01E"',  // H.264 Constrained Baseline 3.0
+  'video/mp4; codecs="avc1.42C01E"',  // H.264 Constrained Baseline 3.0 (alt flags)
+  'video/mp4; codecs="avc1.42001E"',  // H.264 Baseline 3.0 (no constraint flags)
+  'video/mp4; codecs="avc1.640028"',  // H.264 High 4.0 fallback
+];
+
+function pickCodec(): string | null {
+  if (typeof MediaSource === 'undefined') return null;
+  return CODEC_CANDIDATES.find((c) => MediaSource.isTypeSupported(c)) ?? null;
+}
+
+function drainQueue(sb: SourceBuffer, queue: ArrayBuffer[]) {
+  if (sb.updating || queue.length === 0) return;
+  const next = queue.shift()!;
+  try { sb.appendBuffer(next); } catch { /* quota / abort – skip */ }
+}
+
 export function InputOverlay({ browser, onInput, previewSegment }: Props) {
   const divRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const msRef = useRef<MediaSource | null>(null);
   const sbRef = useRef<SourceBuffer | null>(null);
+  // Segments received before MSE is ready are buffered here.
   const queueRef = useRef<ArrayBuffer[]>([]);
-  const readyRef = useRef(false);
 
-  // Initialise MSE once
+  // Initialise MSE once on mount.
   useEffect(() => {
-    if (!videoRef.current || typeof MediaSource === 'undefined') return;
+    const video = videoRef.current;
+    if (!video) return;
+    const codec = pickCodec();
+    if (!codec) return;
+
     const ms = new MediaSource();
     msRef.current = ms;
-    videoRef.current.src = URL.createObjectURL(ms);
+    const objectUrl = URL.createObjectURL(ms);
+    video.src = objectUrl;
 
-    ms.addEventListener('sourceopen', () => {
+    const onSourceOpen = () => {
       try {
-        const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+        const sb = ms.addSourceBuffer(codec);
         sbRef.current = sb;
-        sb.addEventListener('updateend', () => {
-          if (queueRef.current.length > 0) {
-            const next = queueRef.current.shift()!;
-            try { sb.appendBuffer(next); } catch { /* ignore quota errors */ }
-          } else {
-            readyRef.current = true;
-          }
-        });
-        readyRef.current = true;
-      } catch {
-        // Browser may not support the codec — placeholder shown instead
+        sb.addEventListener('updateend', () => drainQueue(sb, queueRef.current));
+        // Drain anything buffered while MSE was initialising.
+        drainQueue(sb, queueRef.current);
+      } catch (err) {
+        console.error('[MSE] addSourceBuffer failed:', err);
       }
-    });
+    };
+
+    ms.addEventListener('sourceopen', onSourceOpen);
+
+    // Autoplay: start as soon as the browser has buffered enough.
+    const onCanPlay = () => { video.play().catch(() => {}); };
+    video.addEventListener('canplay', onCanPlay);
 
     return () => {
-      ms.removeEventListener('sourceopen', () => {});
+      ms.removeEventListener('sourceopen', onSourceOpen);
+      video.removeEventListener('canplay', onCanPlay);
+      URL.revokeObjectURL(objectUrl);
+      if (ms.readyState === 'open') {
+        try { ms.endOfStream(); } catch { /* ignore */ }
+      }
     };
   }, []);
 
-  // Append incoming binary segment to MSE
+  // Append incoming binary segment to MSE (or pre-buffer if not ready yet).
   useEffect(() => {
     if (!previewSegment) return;
     const { payload } = stripHeader(previewSegment);
     if (payload.byteLength === 0) return;
 
     const sb = sbRef.current;
-    if (!sb || msRef.current?.readyState !== 'open') return;
+    const ms = msRef.current;
 
-    if (!sb.updating && readyRef.current) {
-      readyRef.current = false;
-      try { sb.appendBuffer(payload); } catch { readyRef.current = true; }
-    } else {
+    if (!sb || ms?.readyState !== 'open') {
+      // MSE not ready yet — queue so we don't lose the init segment.
       queueRef.current.push(payload);
+      // Keep queue bounded to avoid memory growth.
+      if (queueRef.current.length > 60) queueRef.current.shift();
+      return;
+    }
+
+    if (sb.updating) {
+      queueRef.current.push(payload);
+    } else {
+      try { sb.appendBuffer(payload); } catch { /* quota / abort */ }
     }
   }, [previewSegment]);
-
-  // Auto-play once buffer has some data
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    const onCanPlay = () => v.play().catch(() => {/* autoplay blocked */});
-    v.addEventListener('canplay', onCanPlay);
-    return () => v.removeEventListener('canplay', onCanPlay);
-  }, []);
 
   // Mouse + keyboard event listeners (all in one effect)
   useEffect(() => {

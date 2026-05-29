@@ -254,7 +254,9 @@ async fn ffmpeg_reader_task(
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     let mut sequence: u64 = 0;
-    let mut is_first = true;
+    // Accumulate pre-fragment MP4 boxes (ftyp + moov) before the first moof box.
+    let mut init_buf: Vec<u8> = Vec::new();
+    let mut init_done = false;
 
     loop {
         match stdout.read(&mut buf).await {
@@ -263,32 +265,59 @@ async fn ffmpeg_reader_task(
                 break;
             }
             Ok(n) => {
-                let chunk = Bytes::copy_from_slice(&buf[..n]);
-                let (frame_type, seq, ts_ms) = if is_first {
-                    is_first = false;
-                    (VideoFrameType::Init, 0u64, 0u64)
+                let chunk = &buf[..n];
+
+                if !init_done {
+                    init_buf.extend_from_slice(chunk);
+                    // Check if we've received a moof box — that signals end of init.
+                    if contains_box(&init_buf, b"moof") {
+                        // Split: everything before the first moof is init, the rest is the first media chunk.
+                        let moof_offset = find_box_offset(&init_buf, b"moof").unwrap_or(init_buf.len());
+                        let init_payload = Bytes::copy_from_slice(&init_buf[..moof_offset]);
+                        let media_payload = Bytes::copy_from_slice(&init_buf[moof_offset..]);
+                        init_done = true;
+
+                        let init_encoded = encode_video_frame(&VideoFrame {
+                            frame_type: VideoFrameType::Init,
+                            stream_id: 0,
+                            sequence: 0,
+                            timestamp_ms: 0,
+                            payload: init_payload,
+                        });
+                        *init_cache.lock().await = Some(init_encoded.clone());
+                        if video_tx.receiver_count() > 0 {
+                            let _ = video_tx.send(init_encoded);
+                        }
+
+                        if !media_payload.is_empty() {
+                            let ts = Utc::now().timestamp_millis() as u64;
+                            let media_encoded = encode_video_frame(&VideoFrame {
+                                frame_type: VideoFrameType::Media,
+                                stream_id: 0,
+                                sequence,
+                                timestamp_ms: ts,
+                                payload: media_payload,
+                            });
+                            sequence += 1;
+                            if video_tx.receiver_count() > 0 {
+                                let _ = video_tx.send(media_encoded);
+                            }
+                        }
+                    }
+                    // else keep buffering until we see moof
                 } else {
-                    let s = sequence;
-                    sequence += 1;
                     let ts = Utc::now().timestamp_millis() as u64;
-                    (VideoFrameType::Media, s, ts)
-                };
-
-                let encoded = encode_video_frame(&VideoFrame {
-                    frame_type: frame_type.clone(),
-                    stream_id: 0,
-                    sequence: seq,
-                    timestamp_ms: ts_ms,
-                    payload: chunk,
-                });
-
-                if frame_type == VideoFrameType::Init {
-                    *init_cache.lock().await = Some(encoded.clone());
-                }
-
-                // Only bother sending if someone is listening.
-                if video_tx.receiver_count() > 0 {
-                    let _ = video_tx.send(encoded);
+                    let encoded = encode_video_frame(&VideoFrame {
+                        frame_type: VideoFrameType::Media,
+                        stream_id: 0,
+                        sequence,
+                        timestamp_ms: ts,
+                        payload: Bytes::copy_from_slice(chunk),
+                    });
+                    sequence += 1;
+                    if video_tx.receiver_count() > 0 {
+                        let _ = video_tx.send(encoded);
+                    }
                 }
             }
             Err(e) => {
@@ -297,6 +326,26 @@ async fn ffmpeg_reader_task(
             }
         }
     }
+}
+
+/// Returns true if `data` contains an MP4 box with the given 4-byte type.
+fn contains_box(data: &[u8], box_type: &[u8; 4]) -> bool {
+    find_box_offset(data, box_type).is_some()
+}
+
+/// Returns the byte offset of the first MP4 box with the given type, or None.
+fn find_box_offset(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        let t = &data[pos+4..pos+8];
+        if t == box_type {
+            return Some(pos);
+        }
+        if size < 8 { break; } // guard against malformed data
+        pos += size;
+    }
+    None
 }
 
 // ── Per-connection tasks ─────────────────────────────────────────────────────
