@@ -89,6 +89,11 @@ export function App() {
     return <BrowserDetail tenantId={detailMatch[1]} browserId={detailMatch[2]} />;
   }
 
+  const browsersMatch = path.match(/^\/tenants\/([^/]+)\/browsers$/);
+  if (browsersMatch) {
+    return <BrowserList tenantId={browsersMatch[1]} />;
+  }
+
   const agentsMatch = path.match(/^\/tenants\/([^/]+)\/agents$/);
   if (agentsMatch) {
     return <Agents tenantId={agentsMatch[1]} />;

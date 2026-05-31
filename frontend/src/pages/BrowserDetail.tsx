@@ -33,7 +33,12 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
   });
   const resetMutation = useMutation({
     mutationFn: () => resetBrowser(tenantId, browserId),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] }),
+    onSuccess: () => {
+      // Don't invalidate immediately — wait for WS reset.completed event
+    },
+    onError: (error: Error) => {
+      console.error('Reset failed:', error.message);
+    },
   });
 
   useEffect(() => {
@@ -50,6 +55,13 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
         }
         if (event.type === 'browser.state' || event.type === 'tab.list') {
           queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] });
+        }
+        if (event.type === 'reset.completed') {
+          queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] });
+        }
+        if (event.type === 'reset.failed') {
+          queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] });
+          console.error('Browser reset failed:', (event.payload as { error: string }).error);
         }
         if (event.type === 'preview.segment') {
           setPreviewSegment(event.payload);
@@ -175,7 +187,8 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
           )}
           <button
             className="icon-btn"
-            title="Reset browser"
+            title={browser.status === 'restarting' ? 'Resetting...' : 'Reset browser'}
+            disabled={browser.status === 'restarting' || resetMutation.isPending}
             onClick={() => resetMutation.mutate()}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><path d="M15 9l-6 6M9 9l6 6" /></svg>
@@ -191,9 +204,16 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
         <div className="browser-canvas-area">
           <InputOverlay
             browser={browser}
+            browserStatus={browser.status}
             onInput={(payload) => socket.send({ type: 'input.event', payload: { browserInstanceId: browser.id, ...payload } })}
             previewSegment={previewSegment}
           />
+          {browser.status === 'restarting' && (
+            <div className="reset-overlay">
+              <div className="reset-spinner" />
+              <span>Resetting…</span>
+            </div>
+          )}
         </div>
 
         {/* Right info panel */}

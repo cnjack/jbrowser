@@ -1,9 +1,10 @@
 FROM rust:1.89-bookworm AS rust-builder
+ARG TARGETARCH
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,id=target-control-$TARGETARCH \
     cargo build --release -p jbrowser-control-plane && \
     cp target/release/jbrowser-control-plane /tmp/jbrowser-control-plane
 

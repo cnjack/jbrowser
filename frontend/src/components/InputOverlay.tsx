@@ -13,6 +13,7 @@ export type InputPayload =
 
 interface Props {
   browser: BrowserInstance;
+  browserStatus?: string;
   onInput: (payload: InputPayload) => void;
   previewSegment?: ArrayBuffer | null;
 }
@@ -43,12 +44,16 @@ const PREVENT_DEFAULT_KEYS = new Set([
   'Backspace', ' ', 'F1', 'F3', 'F5', 'F6',
 ]);
 
-export function InputOverlay({ browser, onInput, previewSegment }: Props) {
+export function InputOverlay({ browser, browserStatus, onInput, previewSegment }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const imgPoolRef = useRef<HTMLImageElement[]>([]);
   const [ripples, setRipples] = useState<{ id: number; x: number; y: number }[]>([]);
   const rippleId = useRef(0);
+  // Keep latest browserStatus in a ref so event handlers can check it without
+  // needing to re-register (which would change the useEffect deps).
+  const browserStatusRef = useRef(browserStatus);
+  browserStatusRef.current = browserStatus;
   // Virtual cursor: tracks the mapped remote position and shows it on the canvas
   const [virtualCursor, setVirtualCursor] = useState<{ x: number; y: number; visible: boolean }>({ x: 0, y: 0, visible: false });
 
@@ -120,12 +125,14 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     };
 
     const handleWheel = (e: WheelEvent) => {
+      if (browserStatusRef.current === 'restarting') return;
       e.preventDefault();
       const point = mapCoords(e.clientX, e.clientY);
       onInput({ type: 'wheel', x: point.x, y: point.y, deltaX: e.deltaX, deltaY: e.deltaY, modifiers: getModifiers(e) });
     };
 
     const handleMouseDown = (e: MouseEvent) => {
+      if (browserStatusRef.current === 'restarting') return;
       e.preventDefault();
       canvas.focus();
       // Ripple position relative to canvas-wrap (not canvas), so it stays aligned
@@ -142,12 +149,14 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     };
 
     const handleMouseUp = (e: MouseEvent) => {
+      if (browserStatusRef.current === 'restarting') return;
       const point = mapCoords(e.clientX, e.clientY);
       const button = BTN_MAP[e.button] ?? 'left';
       onInput({ type: 'mouseup', x: point.x, y: point.y, button, clickCount: 1, modifiers: getModifiers(e) });
     };
 
     const handleMouseMove = (e: MouseEvent) => {
+      if (browserStatusRef.current === 'restarting') return;
       const point = mapCoords(e.clientX, e.clientY);
       // Update virtual cursor: convert remote coords back to canvas-local CSS pixels,
       // offset by canvas position within wrap so it stays aligned when letterboxed.
@@ -166,6 +175,7 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     };
 
     const handleDblClick = (e: MouseEvent) => {
+      if (browserStatusRef.current === 'restarting') return;
       const point = mapCoords(e.clientX, e.clientY);
       const button = BTN_MAP[e.button] ?? 'left';
       const modifiers = getModifiers(e);
@@ -176,6 +186,7 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     const handleContextMenu = (e: MouseEvent) => { e.preventDefault(); };
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (browserStatusRef.current === 'restarting') return;
       if (PREVENT_DEFAULT_KEYS.has(e.key)) e.preventDefault();
       const modifiers = getModifiers(e);
       const keyCode = KEY_CODE_MAP[e.code] ?? KEY_CODE_MAP[e.key] ?? 0;
@@ -187,6 +198,7 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (browserStatusRef.current === 'restarting') return;
       const modifiers = getModifiers(e);
       const keyCode = KEY_CODE_MAP[e.code] ?? KEY_CODE_MAP[e.key] ?? 0;
       onInput({ type: 'keyup', key: e.key, code: e.code, modifiers, keyCode });

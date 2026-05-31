@@ -1138,6 +1138,34 @@ h1, h2, h3, .btn, .eyebrow {
   color: var(--muted);
 }
 
+.reset-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 20;
+  color: #fff;
+  font-size: 0.875rem;
+  pointer-events: none;
+}
+
+.reset-spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 .preview-overlay-hint strong {
   display: block;
   font-size: 1rem;
@@ -2890,10 +2918,16 @@ h1, h2, h3, .btn, .eyebrow {
 }
 
 /* Inline create form */
+.tenant-create-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+}
+
 .tenant-create-form {
   display: flex;
   gap: 6px;
-  padding: 8px;
 }
 
 .tenant-create-input {
@@ -2925,6 +2959,13 @@ h1, h2, h3, .btn, .eyebrow {
 .tenant-create-confirm:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.tenant-create-error {
+  font: 500 11px var(--font-body);
+  color: var(--error, #f87171);
+  margin: 0;
+  padding: 0 2px;
 }
 
 /* ── Settings Page ────────────────────────────────────────────────────────── */

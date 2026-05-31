@@ -2,6 +2,8 @@ export type ControlEvent =
   | { type: 'browser.state'; payload: unknown }
   | { type: 'tab.list'; payload: unknown }
   | { type: 'preview.segment'; payload: ArrayBuffer }
+  | { type: 'reset.completed'; payload: unknown }
+  | { type: 'reset.failed'; payload: { error: string } }
   | { type: 'error'; payload: unknown };
 
 export class ControlSocket {
@@ -46,9 +48,11 @@ export class ControlSocket {
       if (
         message.type === 'browser.state' ||
         message.type === 'tab.list' ||
+        message.type === 'reset.completed' ||
+        message.type === 'reset.failed' ||
         message.type === 'error'
       ) {
-        onEvent({ type: message.type, payload: message.payload });
+        onEvent({ type: message.type, payload: message.payload } as ControlEvent);
       }
     };
     this.socket.onclose = () => {

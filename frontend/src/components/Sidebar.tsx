@@ -120,24 +120,33 @@ export function Sidebar({ activePage, tenantId, browserCount }: Props) {
             </div>
             <div className="tenant-dropdown-divider" />
             {creating ? (
-              <form className="tenant-create-form" onSubmit={handleCreateSubmit}>
-                <input
-                  ref={inputRef}
-                  className="tenant-create-input"
-                  type="text"
-                  placeholder="Workspace name…"
-                  value={newTenantName}
-                  onChange={(e) => setNewTenantName(e.target.value)}
-                  disabled={createMutation.isPending}
-                />
-                <button
-                  type="submit"
-                  className="tenant-create-confirm"
-                  disabled={!newTenantName.trim() || createMutation.isPending}
-                >
-                  {createMutation.isPending ? '…' : 'Create'}
-                </button>
-              </form>
+              <div className="tenant-create-wrap">
+                <form className="tenant-create-form" onSubmit={handleCreateSubmit}>
+                  <input
+                    ref={inputRef}
+                    className="tenant-create-input"
+                    type="text"
+                    placeholder="Workspace name…"
+                    value={newTenantName}
+                    onChange={(e) => setNewTenantName(e.target.value)}
+                    disabled={createMutation.isPending}
+                  />
+                  <button
+                    type="submit"
+                    className="tenant-create-confirm"
+                    disabled={!newTenantName.trim() || createMutation.isPending}
+                  >
+                    {createMutation.isPending ? '…' : 'Create'}
+                  </button>
+                </form>
+                {createMutation.isError && (
+                  <p className="tenant-create-error">
+                    {createMutation.error instanceof Error
+                      ? createMutation.error.message
+                      : 'Failed to create workspace'}
+                  </p>
+                )}
+              </div>
             ) : (
               <button
                 type="button"

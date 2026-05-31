@@ -1,0 +1,5 @@
+# Clippy configuration for jbrowser workspace
+# Enforce reasonable file sizes to keep code maintainable
+
+# Maximum number of lines per file (warn if exceeded)
+too-many-lines-threshold = 400
