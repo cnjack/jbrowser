@@ -15,7 +15,13 @@ export function Login() {
     try {
       const response = await login(email, password);
       setSession(response.access_token, response.user.email, response.tenants);
-      window.history.pushState(null, '', `/tenants/${response.tenants[0].id}/browsers`);
+      const params = new URLSearchParams(window.location.search);
+      const redirect = params.get('redirect');
+      if (redirect) {
+        window.history.pushState(null, '', redirect);
+      } else {
+        window.history.pushState(null, '', `/tenants/${response.tenants[0].id}/browsers`);
+      }
       window.location.reload();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');
@@ -72,6 +78,9 @@ export function Login() {
             />
           </div>
           <button type="submit" className="btn-primary">Sign in</button>
+          <p className="auth-alt-link">
+            Don&apos;t have an account? <a href="/signup">Create account</a>
+          </p>
         </form>
       </section>
     </main>

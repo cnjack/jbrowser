@@ -2,7 +2,10 @@ FROM rust:1.89-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p jbrowser-agent
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p jbrowser-agent && \
+    cp target/release/jbrowser-agent /tmp/jbrowser-agent
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 10001 jbrowser
-COPY --from=builder /app/target/release/jbrowser-agent /usr/local/bin/jbrowser-agent
+COPY --from=builder /tmp/jbrowser-agent /usr/local/bin/jbrowser-agent
 RUN mkdir -p /home/jbrowser/.local/share/jbrowser-agent \
     && chown -R jbrowser:jbrowser /home/jbrowser/.local
 USER jbrowser

@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use jbrowser_shared::{
     constants::{DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH},
@@ -37,6 +37,10 @@ use tower_http::{
 use tracing::info;
 use uuid::Uuid;
 
+use crate::db::repo;
+
+// ── Config ──────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub host: String,
@@ -46,7 +50,6 @@ pub struct AppConfig {
     pub public_base_url: String,
     pub demo_email: String,
     pub demo_password: String,
-    /// If set, a seed agent registration token is always available in the store.
     pub seed_agent_token: Option<String>,
 }
 
@@ -74,31 +77,114 @@ fn required_env(name: &str) -> anyhow::Result<String> {
     env::var(name).map_err(|_| anyhow::anyhow!("missing required env var: {name}"))
 }
 
+// ── AppState ────────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
-    store: Arc<RwLock<Store>>,
-    /// Global broadcast of raw video bytes (legacy, replaced by per-browser channels)
+    pool: sqlx::MySqlPool,
+    /// Runtime agent state (in-memory only, per AGENTS.md)
+    agents: Arc<RwLock<HashMap<Uuid, AgentSummary>>>,
+    /// Runtime browser state (in-memory only, per AGENTS.md)
+    browsers: Arc<RwLock<HashMap<Uuid, BrowserInstance>>>,
+    /// Global broadcast of raw video bytes (legacy)
     preview_tx: broadcast::Sender<Vec<u8>>,
-    /// Per-agent command senders: agent_id → mpsc::Sender<String (JSON)>
+    /// Per-agent command senders
     agent_senders: Arc<RwLock<HashMap<Uuid, mpsc::Sender<String>>>>,
-    /// Per-browser video broadcast: browser_id → broadcast::Sender<Vec<u8>>
+    /// Per-browser video broadcast
     browser_preview: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Vec<u8>>>>>,
-    /// Per-browser last video frame cache for immediate delivery on subscribe
+    /// Per-browser last video frame cache
     browser_last_frame: Arc<RwLock<HashMap<Uuid, Vec<u8>>>>,
-    /// Per-browser event broadcast: browser_id → broadcast::Sender<String (JSON)>
+    /// Per-browser event broadcast
     browser_events: Arc<RwLock<HashMap<Uuid, broadcast::Sender<String>>>>,
-    /// CDP tunnel: session_id → sender for forwarding CDP responses back to the CDP client
+    /// CDP tunnel senders
     cdp_tunnel_senders: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Self {
-        let store = Store::seed(&config);
+    pub async fn new(config: AppConfig, pool: sqlx::MySqlPool) -> Self {
         let (preview_tx, _) = broadcast::channel(64);
+
+        // Seed demo user/tenant if not present
+        let existing = repo::get_user_by_email(&pool, &config.demo_email)
+            .await
+            .ok()
+            .flatten();
+        if existing.is_none() {
+            let tenant_id = Uuid::now_v7();
+            let user_id = Uuid::now_v7();
+            let password_hash = hash_password(&config.demo_password).expect("demo password hash");
+
+            let _ = repo::create_tenant(&pool, tenant_id, "Default Tenant", "default").await;
+            let _ = repo::create_user(
+                &pool,
+                user_id,
+                &config.demo_email,
+                &password_hash,
+                "Demo Admin",
+            )
+            .await;
+            let _ = repo::add_tenant_member(&pool, tenant_id, user_id, "admin").await;
+
+            if let Some(raw_token) = &config.seed_agent_token {
+                let token_id = Uuid::now_v7();
+                let token_hash = hash_token(raw_token);
+                let prefix: String = raw_token.chars().take(12).collect();
+                let _ = repo::create_token(
+                    &pool,
+                    &repo::CreateToken {
+                        id: token_id,
+                        tenant_id,
+                        token_type: "agent_registration",
+                        name: Some("seed-agent-token"),
+                        token_hash: &token_hash,
+                        token_prefix: &prefix,
+                        created_by: Some(&user_id.to_string()),
+                    },
+                )
+                .await;
+            }
+            info!(email = %config.demo_email, "seeded demo user + tenant");
+        } else if let Some(raw_token) = &config.seed_agent_token {
+            let token_hash = hash_token(raw_token);
+            if repo::get_token_by_hash(&pool, &token_hash)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                if let Some(user_row) = existing {
+                    let user_id = Uuid::parse_str(&user_row.id).unwrap();
+                    let tenant_rows = repo::get_user_tenants(&pool, user_id)
+                        .await
+                        .unwrap_or_default();
+                    if let Some(t) = tenant_rows.first() {
+                        let tenant_id = Uuid::parse_str(&t.id).unwrap();
+                        let token_id = Uuid::now_v7();
+                        let prefix: String = raw_token.chars().take(12).collect();
+                        let _ = repo::create_token(
+                            &pool,
+                            &repo::CreateToken {
+                                id: token_id,
+                                tenant_id,
+                                token_type: "agent_registration",
+                                name: Some("seed-agent-token"),
+                                token_hash: &token_hash,
+                                token_prefix: &prefix,
+                                created_by: Some(&user_id.to_string()),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
         Self {
             config,
-            store: Arc::new(RwLock::new(store)),
+            pool,
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            browsers: Arc::new(RwLock::new(HashMap::new())),
             preview_tx,
             agent_senders: Arc::new(RwLock::new(HashMap::new())),
             browser_preview: Arc::new(RwLock::new(HashMap::new())),
@@ -109,106 +195,7 @@ impl AppState {
     }
 }
 
-#[derive(Debug)]
-struct Store {
-    tenants: HashMap<Uuid, Tenant>,
-    users: HashMap<Uuid, User>,
-    browsers: HashMap<Uuid, BrowserInstance>,
-    agents: HashMap<Uuid, AgentSummary>,
-    tokens: HashMap<Uuid, TokenRecord>,
-    audit_logs: Vec<AuditLog>,
-}
-
-impl Store {
-    fn seed(config: &AppConfig) -> Self {
-        let tenant_id = Uuid::now_v7();
-        let user_id = Uuid::now_v7();
-        let agent_id = Uuid::now_v7();
-        let browser_id = Uuid::now_v7();
-        let password_hash = hash_password(&config.demo_password).expect("demo password hash");
-        let tab = BrowserTab {
-            id: "demo-tab".to_string(),
-            title: "JBrowser Demo".to_string(),
-            url: "about:blank".to_string(),
-            active: true,
-        };
-        let agent = AgentSummary {
-            id: agent_id,
-            tenant_id,
-            browser_instance_id: browser_id,
-            name: "demo-agent".to_string(),
-            status: AgentStatus::Offline,
-            browser_type: "chromium".to_string(),
-            browser_version: "demo".to_string(),
-            last_heartbeat_at: None,
-        };
-        let browser = BrowserInstance {
-            id: browser_id,
-            tenant_id,
-            agent_id,
-            name: "demo-browser".to_string(),
-            status: BrowserStatus::Offline,
-            browser_type: "chromium".to_string(),
-            browser_version: "demo".to_string(),
-            active_tab_id: Some(tab.id.clone()),
-            tabs: vec![tab],
-            proxy_enabled: false,
-            viewport_width: DEFAULT_VIEWPORT_WIDTH,
-            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
-            viewer_count: 0,
-            agent_name: agent.name.clone(),
-            agent_status: agent.status.clone(),
-            last_heartbeat_at: None,
-        };
-
-        let mut tokens: HashMap<Uuid, TokenRecord> = HashMap::new();
-
-        // If a seed agent token is configured, register it so the agent can connect
-        // even after control-plane restarts (no manual re-registration needed).
-        if let Some(raw_token) = &config.seed_agent_token {
-            let token_id = Uuid::now_v7();
-            tokens.insert(token_id, TokenRecord {
-                id: token_id,
-                tenant_id,
-                token_type: TokenType::AgentRegistration,
-                name: Some("seed-agent-token".to_string()),
-                token_hash: hash_token(raw_token),
-                token_prefix: raw_token.chars().take(12).collect(),
-                created_by: Some(user_id.to_string()),
-                revoked_at: None,
-                created_at: Utc::now(),
-            });
-        }
-
-        Self {
-            tenants: HashMap::from([(
-                tenant_id,
-                Tenant {
-                    id: tenant_id,
-                    name: "Default Tenant".to_string(),
-                    slug: "default".to_string(),
-                },
-            )]),
-            users: HashMap::from([(
-                user_id,
-                User {
-                    id: user_id,
-                    email: config.demo_email.clone(),
-                    display_name: "Demo Admin".to_string(),
-                    password_hash,
-                    tenants: vec![TenantClaim {
-                        id: tenant_id,
-                        role: "admin".to_string(),
-                    }],
-                },
-            )]),
-            browsers: HashMap::from([(browser_id, browser)]),
-            agents: HashMap::from([(agent_id, agent)]),
-            tokens,
-            audit_logs: Vec::new(),
-        }
-    }
-}
+// ── Router ──────────────────────────────────────────────────────────────
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -216,7 +203,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/signup", post(signup))
         .route("/api/v1/auth/me", get(me))
+        .route("/api/v1/auth/change-password", post(change_password))
         .route("/api/v1/agents/register", post(agent_register))
         .route("/api/v1/agents/connect", get(ws_agent))
         .route(
@@ -242,7 +231,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tenants/:tenant_id/tokens/cdp/:token_id/revoke",
-            post(revoke_token),
+            post(revoke_token_handler),
         )
         .route(
             "/api/v1/tenants/:tenant_id/tokens/cdp/:token_id/rotate",
@@ -254,12 +243,42 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tenants/:tenant_id/agent-registration-tokens/:token_id/revoke",
-            post(revoke_token),
+            post(revoke_token_handler),
         )
         .route(
             "/api/v1/tenants/:tenant_id/audit-logs",
             get(list_audit_logs),
         )
+        .route(
+            "/api/v1/tenants/:tenant_id/invitations",
+            get(list_invitations).post(create_invitation),
+        )
+        .route(
+            "/api/v1/tenants/:tenant_id/invitations/:invitation_id",
+            axum::routing::delete(delete_invitation_handler),
+        )
+        .route(
+            "/api/v1/invitations/:token/validate",
+            get(validate_invitation),
+        )
+        .route("/api/v1/invitations/:token/accept", post(accept_invitation))
+        .route(
+            "/api/v1/tenants/:tenant_id/members",
+            get(list_members_handler),
+        )
+        .route(
+            "/api/v1/tenants/:tenant_id/members/leave",
+            post(leave_tenant),
+        )
+        .route(
+            "/api/v1/tenants/:tenant_id/members/:user_id",
+            axum::routing::patch(update_member_role_handler).delete(remove_member),
+        )
+        .route(
+            "/api/v1/tenants/:tenant_id",
+            axum::routing::patch(update_tenant_handler).delete(delete_tenant_handler),
+        )
+        .route("/api/v1/tenants", post(create_tenant_handler))
         .route("/ws/control", get(ws_control))
         .route(
             "/cdp/tenants/:tenant_id/browser-instances/:browser_id/json/version",
@@ -278,13 +297,14 @@ pub fn build_router(state: AppState) -> Router {
             get(cdp_ws_tunnel),
         )
         .fallback_service(
-            ServeDir::new("frontend/dist")
-                .fallback(ServeFile::new("frontend/dist/index.html")),
+            ServeDir::new("frontend/dist").fallback(ServeFile::new("frontend/dist/index.html")),
         )
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
+
+// ── Health / Ready / Metrics ────────────────────────────────────────────
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
@@ -295,15 +315,14 @@ async fn ready(State(state): State<AppState>) -> Json<Value> {
         "status": "ok",
         "checks": {
             "database_url_configured": !state.config.database_url.is_empty(),
-            "state": "in_memory_mvp"
+            "state": "mysql_hybrid"
         }
     }))
 }
 
 async fn metrics(State(state): State<AppState>) -> String {
-    let store = state.store.read().await;
-    let online = store
-        .browsers
+    let browsers = state.browsers.read().await;
+    let online = browsers
         .values()
         .filter(|browser| browser.status == BrowserStatus::Online)
         .count();
@@ -312,6 +331,8 @@ async fn metrics(State(state): State<AppState>) -> String {
         online
     )
 }
+
+// ── Auth: Login ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct LoginRequest {
@@ -331,39 +352,225 @@ async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AppError> {
-    let mut store = state.store.write().await;
-    let user = store
-        .users
-        .values()
-        .find(|user| user.email == req.email)
-        .cloned()
+    let user_row = repo::get_user_by_email(&state.pool, &req.email)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
         .ok_or(AppError::unauthorized("invalid credentials"))?;
 
-    verify_password(&req.password, &user.password_hash)
-        .map_err(|_| AppError::unauthorized("invalid credentials"))?;
+    verify_password(&req.password, &user_row.password_hash)?;
 
-    let access_token = issue_jwt(&state.config.jwt_secret, &user)?;
-    let tenants = user
-        .tenants
+    let user_id = Uuid::parse_str(&user_row.id).unwrap();
+    let tenant_rows = repo::get_user_tenants(&state.pool, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let tenants_claim: Vec<TenantClaim> = tenant_rows
         .iter()
-        .filter_map(|claim| store.tenants.get(&claim.id).cloned())
-        .collect::<Vec<_>>();
-    store.audit_logs.push(AuditLog::new(
-        user.tenants[0].id,
-        "user",
-        user.id.to_string(),
-        "user.login",
-        "web_ui",
-        None,
-    ));
+        .map(|t| TenantClaim {
+            id: Uuid::parse_str(&t.id).unwrap(),
+            role: t.role.clone(),
+        })
+        .collect();
+
+    let user = User {
+        id: user_id,
+        email: user_row.email,
+        display_name: user_row.display_name.unwrap_or_default(),
+        password_hash: user_row.password_hash,
+        tenants: tenants_claim.clone(),
+    };
+    let access_token = issue_jwt(&state.config.jwt_secret, &user)?;
+    let tenants: Vec<Tenant> = tenant_rows
+        .iter()
+        .map(|t| Tenant {
+            id: Uuid::parse_str(&t.id).unwrap(),
+            name: t.name.clone(),
+            slug: t.slug.clone(),
+            role: t.role.clone(),
+        })
+        .collect();
+
+    if let Some(tc) = tenants_claim.first() {
+        let _ = repo::create_audit_log(
+            &state.pool,
+            &repo::CreateAuditLog {
+                id: Uuid::now_v7(),
+                tenant_id: tc.id,
+                actor_type: "user",
+                actor_id: &user_id.to_string(),
+                action: "user.login",
+                source: "web_ui",
+                resource_type: None,
+                resource_id: None,
+                browser_instance_id: None,
+                tab_id: None,
+                metadata: None,
+            },
+        )
+        .await;
+    }
 
     Ok(Json(LoginResponse {
         access_token,
         token_type: "Bearer",
-        user: UserResponse::from(user),
+        user: UserResponse {
+            id: user_id,
+            email: user.email,
+            display_name: user.display_name,
+        },
         tenants,
     }))
 }
+
+// ── Auth: Signup ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SignupRequest {
+    email: String,
+    password: String,
+    display_name: String,
+}
+
+async fn signup(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    Json(req): Json<SignupRequest>,
+) -> Result<Json<LoginResponse>, AppError> {
+    if req.password.len() < 8 {
+        return Err(AppError::bad_request(
+            "password must be at least 8 characters",
+        ));
+    }
+    if repo::get_user_by_email(&state.pool, &req.email)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .is_some()
+    {
+        return Err(AppError::bad_request("email already registered"));
+    }
+
+    let user_id = Uuid::now_v7();
+    let pw_hash = hash_password(&req.password).map_err(|e| AppError::internal(e.to_string()))?;
+    repo::create_user(
+        &state.pool,
+        user_id,
+        &req.email,
+        &pw_hash,
+        &req.display_name,
+    )
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let invite_token = params.get("invite_token");
+    let mut tenants_claim = Vec::new();
+    let mut tenants_resp = Vec::new();
+
+    if let Some(raw_token) = invite_token {
+        let token_hash = hash_token(raw_token);
+        if let Some(inv) = repo::get_invitation_by_token_hash(&state.pool, &token_hash)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?
+        {
+            let tenant_id = Uuid::parse_str(&inv.tenant_id).unwrap();
+            repo::add_tenant_member(&state.pool, tenant_id, user_id, &inv.role)
+                .await
+                .map_err(|e| AppError::internal(e.to_string()))?;
+            let inv_id = Uuid::parse_str(&inv.id).unwrap();
+            repo::accept_invitation(&state.pool, inv_id, user_id)
+                .await
+                .map_err(|e| AppError::internal(e.to_string()))?;
+            if let Some(t) = repo::get_tenant(&state.pool, tenant_id)
+                .await
+                .map_err(|e| AppError::internal(e.to_string()))?
+            {
+                tenants_claim.push(TenantClaim {
+                    id: tenant_id,
+                    role: inv.role.clone(),
+                });
+                tenants_resp.push(Tenant {
+                    id: tenant_id,
+                    name: t.name,
+                    slug: t.slug,
+                    role: inv.role.clone(),
+                });
+            }
+        } else {
+            return Err(AppError::bad_request("invalid or expired invitation"));
+        }
+    } else {
+        let tenant_id = Uuid::now_v7();
+        let slug = generate_slug(&req.display_name);
+        let tenant_name = format!("{}'s Workspace", req.display_name);
+        repo::create_tenant(&state.pool, tenant_id, &tenant_name, &slug)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        repo::add_tenant_member(&state.pool, tenant_id, user_id, "admin")
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        tenants_claim.push(TenantClaim {
+            id: tenant_id,
+            role: "admin".to_string(),
+        });
+        tenants_resp.push(Tenant {
+            id: tenant_id,
+            name: tenant_name,
+            slug,
+            role: "admin".to_string(),
+        });
+    }
+
+    let user = User {
+        id: user_id,
+        email: req.email,
+        display_name: req.display_name,
+        password_hash: pw_hash,
+        tenants: tenants_claim,
+    };
+    let access_token = issue_jwt(&state.config.jwt_secret, &user)?;
+    Ok(Json(LoginResponse {
+        access_token,
+        token_type: "Bearer",
+        user: UserResponse {
+            id: user_id,
+            email: user.email,
+            display_name: user.display_name,
+        },
+        tenants: tenants_resp,
+    }))
+}
+
+fn generate_slug(name: &str) -> String {
+    let base: String = name
+        .chars()
+        .filter_map(|c| {
+            if c.is_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if c == ' ' || c == '-' {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect();
+    let base = base.trim_matches('-').to_string();
+    let suffix: String = (0..3)
+        .map(|_| {
+            let idx = rand::random::<u8>() % 36;
+            if idx < 10 {
+                (b'0' + idx) as char
+            } else {
+                (b'a' + idx - 10) as char
+            }
+        })
+        .collect();
+    if base.is_empty() {
+        format!("workspace-{suffix}")
+    } else {
+        format!("{base}-{suffix}")
+    }
+}
+
+// ── Auth: Me ────────────────────────────────────────────────────────────
 
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, AppError> {
     let claims = authorize(&state, &headers, None).await?;
@@ -376,19 +583,53 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Va
     })))
 }
 
+// ── Auth: Change Password ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<Value>, AppError> {
+    let claims = authorize(&state, &headers, None).await?;
+    if req.new_password.len() < 8 {
+        return Err(AppError::bad_request(
+            "password must be at least 8 characters",
+        ));
+    }
+    let user_id = Uuid::parse_str(&claims.sub).unwrap();
+    let user = repo::get_user_by_id(&state.pool, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .ok_or(AppError::not_found("user"))?;
+    verify_password(&req.current_password, &user.password_hash)?;
+    let new_hash =
+        hash_password(&req.new_password).map_err(|e| AppError::internal(e.to_string()))?;
+    repo::update_user_password(&state.pool, user_id, &new_hash)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({"message": "password changed"})))
+}
+
+// ── Browser Instances ───────────────────────────────────────────────────
+
 async fn list_browsers(
     State(state): State<AppState>,
     Path(tenant_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     authorize(&state, &headers, Some(tenant_id)).await?;
-    let store = state.store.read().await;
-    let data = store
-        .browsers
+    let browsers = state.browsers.read().await;
+    let data: Vec<_> = browsers
         .values()
         .filter(|browser| browser.tenant_id == tenant_id)
         .cloned()
-        .collect::<Vec<_>>();
+        .collect();
     Ok(Json(json!({ "data": data })))
 }
 
@@ -398,9 +639,8 @@ async fn get_browser(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     authorize(&state, &headers, Some(tenant_id)).await?;
-    let store = state.store.read().await;
-    let browser = store
-        .browsers
+    let browsers = state.browsers.read().await;
+    let browser = browsers
         .get(&browser_id)
         .filter(|browser| browser.tenant_id == tenant_id)
         .cloned()
@@ -415,9 +655,8 @@ async fn reset_browser(
 ) -> Result<Json<Value>, AppError> {
     let claims = authorize(&state, &headers, Some(tenant_id)).await?;
     let (snapshot, agent_id) = {
-        let mut store = state.store.write().await;
-        let browser = store
-            .browsers
+        let mut browsers = state.browsers.write().await;
+        let browser = browsers
             .get_mut(&browser_id)
             .filter(|browser| browser.tenant_id == tenant_id)
             .ok_or_else(|| AppError::not_found("browser instance"))?;
@@ -431,18 +670,27 @@ async fn reset_browser(
         browser.active_tab_id = Some("blank".to_string());
         let snapshot = browser.clone();
         let agent_id = browser.agent_id;
-        store.audit_logs.push(AuditLog::new(
-            tenant_id,
-            "user",
-            claims.sub,
-            "browser.reset_requested",
-            "web_ui",
-            Some(browser_id),
-        ));
         (snapshot, agent_id)
     };
 
-    // Forward reset to agent
+    let _ = repo::create_audit_log(
+        &state.pool,
+        &repo::CreateAuditLog {
+            id: Uuid::now_v7(),
+            tenant_id,
+            actor_type: "user",
+            actor_id: &claims.sub,
+            action: "browser.reset_requested",
+            source: "web_ui",
+            resource_type: None,
+            resource_id: None,
+            browser_instance_id: Some(browser_id),
+            tab_id: None,
+            metadata: None,
+        },
+    )
+    .await;
+
     {
         let senders = state.agent_senders.read().await;
         if let Some(tx) = senders.get(&agent_id) {
@@ -458,19 +706,44 @@ async fn reset_browser(
     Ok(Json(json!({ "data": snapshot })))
 }
 
+async fn delete_browser(
+    State(state): State<AppState>,
+    Path((tenant_id, browser_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    authorize(&state, &headers, Some(tenant_id)).await?;
+    let removed = {
+        let mut browsers = state.browsers.write().await;
+        browsers
+            .remove(&browser_id)
+            .filter(|b| b.tenant_id == tenant_id)
+            .is_some()
+    };
+    if removed {
+        state.browser_preview.write().await.remove(&browser_id);
+        state.browser_last_frame.write().await.remove(&browser_id);
+        state.browser_events.write().await.remove(&browser_id);
+        let _ = repo::delete_browser_instance(&state.pool, tenant_id, browser_id).await;
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::not_found("browser instance"))
+    }
+}
+
+// ── Agents ──────────────────────────────────────────────────────────────
+
 async fn list_agents(
     State(state): State<AppState>,
     Path(tenant_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     authorize(&state, &headers, Some(tenant_id)).await?;
-    let store = state.store.read().await;
-    let data = store
-        .agents
+    let agents = state.agents.read().await;
+    let data: Vec<_> = agents
         .values()
         .filter(|agent| agent.tenant_id == tenant_id)
         .cloned()
-        .collect::<Vec<_>>();
+        .collect();
     Ok(Json(json!({ "data": data })))
 }
 
@@ -480,9 +753,8 @@ async fn get_agent(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     authorize(&state, &headers, Some(tenant_id)).await?;
-    let store = state.store.read().await;
-    let agent = store
-        .agents
+    let agents = state.agents.read().await;
+    let agent = agents
         .get(&agent_id)
         .filter(|agent| agent.tenant_id == tenant_id)
         .cloned()
@@ -495,40 +767,28 @@ async fn delete_agent(
     Path((tenant_id, agent_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, AppError> {
-    authorize(&state, &headers, Some(tenant_id)).await?;
-    let mut store = state.store.write().await;
-    let removed = store
-        .agents
-        .remove(&agent_id)
-        .filter(|a| a.tenant_id == tenant_id)
-        .is_some();
-    if removed {
-        // Also remove the associated browser instance
-        store.browsers.retain(|_, b| b.agent_id != agent_id);
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::not_found("agent"))
-    }
+    require_admin(&state, &headers, tenant_id).await?;
+    let agent = {
+        let agents = state.agents.read().await;
+        agents
+            .get(&agent_id)
+            .filter(|a| a.tenant_id == tenant_id)
+            .cloned()
+            .ok_or(AppError::not_found("agent"))?
+    };
+    state.agents.write().await.remove(&agent_id);
+    let browser_id = agent.browser_instance_id;
+    state.browsers.write().await.remove(&browser_id);
+    state.agent_senders.write().await.remove(&agent_id);
+    state.browser_preview.write().await.remove(&browser_id);
+    state.browser_last_frame.write().await.remove(&browser_id);
+    state.browser_events.write().await.remove(&browser_id);
+    let _ = repo::delete_browser_instance(&state.pool, tenant_id, browser_id).await;
+    let _ = repo::delete_agent(&state.pool, tenant_id, agent_id).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn delete_browser(
-    State(state): State<AppState>,
-    Path((tenant_id, browser_id)): Path<(Uuid, Uuid)>,
-    headers: HeaderMap,
-) -> Result<StatusCode, AppError> {
-    authorize(&state, &headers, Some(tenant_id)).await?;
-    let mut store = state.store.write().await;
-    let removed = store
-        .browsers
-        .remove(&browser_id)
-        .filter(|b| b.tenant_id == tenant_id)
-        .is_some();
-    if removed {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::not_found("browser instance"))
-    }
-}
+// ── Tokens ──────────────────────────────────────────────────────────────
 
 async fn list_cdp_tokens(
     State(state): State<AppState>,
@@ -536,15 +796,10 @@ async fn list_cdp_tokens(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     authorize(&state, &headers, Some(tenant_id)).await?;
-    let store = state.store.read().await;
-    let data = store
-        .tokens
-        .values()
-        .filter(|token| {
-            token.tenant_id == tenant_id && token.token_type == TokenType::TenantCdpAccess
-        })
-        .map(TokenResponse::from)
-        .collect::<Vec<_>>();
+    let rows = repo::list_tokens(&state.pool, tenant_id, "tenant_cdp_access")
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let data: Vec<_> = rows.iter().map(token_row_to_response).collect();
     Ok(Json(json!({ "data": data })))
 }
 
@@ -554,15 +809,10 @@ async fn list_agent_registration_tokens(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     authorize(&state, &headers, Some(tenant_id)).await?;
-    let store = state.store.read().await;
-    let data = store
-        .tokens
-        .values()
-        .filter(|token| {
-            token.tenant_id == tenant_id && token.token_type == TokenType::AgentRegistration
-        })
-        .map(TokenResponse::from)
-        .collect::<Vec<_>>();
+    let rows = repo::list_tokens(&state.pool, tenant_id, "agent_registration")
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let data: Vec<_> = rows.iter().map(token_row_to_response).collect();
     Ok(Json(json!({ "data": data })))
 }
 
@@ -578,11 +828,12 @@ async fn create_cdp_token(
     body: Option<Json<CreateTokenRequest>>,
 ) -> Result<Json<Value>, AppError> {
     let name = body.and_then(|Json(req)| req.name);
-    create_token(
+    create_token_impl(
         state,
         tenant_id,
         headers,
-        TokenType::TenantCdpAccess,
+        "tenant_cdp_access",
+        "jbr_cdp",
         name,
     )
     .await
@@ -595,80 +846,110 @@ async fn create_agent_registration_token(
     body: Option<Json<CreateTokenRequest>>,
 ) -> Result<Json<Value>, AppError> {
     let name = body.and_then(|Json(req)| req.name);
-    create_token(
+    create_token_impl(
         state,
         tenant_id,
         headers,
-        TokenType::AgentRegistration,
+        "agent_registration",
+        "jbr_reg",
         name,
     )
     .await
 }
 
-async fn create_token(
+async fn create_token_impl(
     state: AppState,
     tenant_id: Uuid,
     headers: HeaderMap,
-    token_type: TokenType,
+    token_type: &str,
+    prefix: &str,
     name: Option<String>,
 ) -> Result<Json<Value>, AppError> {
-    let claims = authorize(&state, &headers, Some(tenant_id)).await?;
-    let raw = generate_token(match token_type {
-        TokenType::AgentRegistration => "jbr_reg",
-        TokenType::AgentRuntime => "jbr_agent",
-        TokenType::TenantCdpAccess => "jbr_cdp",
-    });
-    let record = TokenRecord {
-        id: Uuid::now_v7(),
-        tenant_id,
-        token_type,
-        name,
-        token_hash: hash_token(&raw),
-        token_prefix: raw.chars().take(12).collect(),
-        created_by: Some(claims.sub.clone()),
-        revoked_at: None,
-        created_at: Utc::now(),
-    };
+    let claims = require_admin(&state, &headers, tenant_id).await?;
+    let raw = generate_token(prefix);
+    let id = Uuid::now_v7();
+    let thash = hash_token(&raw);
+    let tprefix: String = raw.chars().take(12).collect();
+
+    repo::create_token(
+        &state.pool,
+        &repo::CreateToken {
+            id,
+            tenant_id,
+            token_type,
+            name: name.as_deref(),
+            token_hash: &thash,
+            token_prefix: &tprefix,
+            created_by: Some(&claims.sub),
+        },
+    )
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let _ = repo::create_audit_log(
+        &state.pool,
+        &repo::CreateAuditLog {
+            id: Uuid::now_v7(),
+            tenant_id,
+            actor_type: "user",
+            actor_id: &claims.sub,
+            action: "token.created",
+            source: "web_ui",
+            resource_type: None,
+            resource_id: None,
+            browser_instance_id: None,
+            tab_id: None,
+            metadata: None,
+        },
+    )
+    .await;
+
     let response = json!({
-        "data": TokenResponse::from(&record),
+        "data": {
+            "id": id,
+            "tenant_id": tenant_id,
+            "token_type": token_type,
+            "name": name,
+            "token_prefix": tprefix,
+            "created_by": claims.sub,
+            "revoked_at": null,
+            "created_at": Utc::now()
+        },
         "token": raw
     });
-    let mut store = state.store.write().await;
-    store.audit_logs.push(AuditLog::new(
-        tenant_id,
-        "user",
-        claims.sub,
-        "token.created",
-        "web_ui",
-        None,
-    ));
-    store.tokens.insert(record.id, record);
     Ok(Json(response))
 }
 
-async fn revoke_token(
+async fn revoke_token_handler(
     State(state): State<AppState>,
     Path((tenant_id, token_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
-    let claims = authorize(&state, &headers, Some(tenant_id)).await?;
-    let mut store = state.store.write().await;
-    let token = store
-        .tokens
-        .get_mut(&token_id)
-        .filter(|token| token.tenant_id == tenant_id)
-        .ok_or_else(|| AppError::not_found("token"))?;
-    token.revoked_at = Some(Utc::now());
-    let response = TokenResponse::from(&*token);
-    store.audit_logs.push(AuditLog::new(
-        tenant_id,
-        "user",
-        claims.sub,
-        "token.revoked",
-        "web_ui",
-        None,
-    ));
-    Ok(Json(json!({ "data": response })))
+    let claims = require_admin(&state, &headers, tenant_id).await?;
+    let revoked = repo::revoke_token(&state.pool, tenant_id, token_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if !revoked {
+        return Err(AppError::not_found("token"));
+    }
+    let _ = repo::create_audit_log(
+        &state.pool,
+        &repo::CreateAuditLog {
+            id: Uuid::now_v7(),
+            tenant_id,
+            actor_type: "user",
+            actor_id: &claims.sub,
+            action: "token.revoked",
+            source: "web_ui",
+            resource_type: None,
+            resource_id: None,
+            browser_instance_id: None,
+            tab_id: None,
+            metadata: None,
+        },
+    )
+    .await;
+    Ok(Json(json!({ "data": { "id": token_id, "revoked": true } })))
 }
 
 async fn rotate_token(
@@ -676,46 +957,93 @@ async fn rotate_token(
     Path((tenant_id, token_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
-    let claims = authorize(&state, &headers, Some(tenant_id)).await?;
-    let mut store = state.store.write().await;
-    let token = store
-        .tokens
-        .get_mut(&token_id)
-        .filter(|token| {
-            token.tenant_id == tenant_id && token.token_type == TokenType::TenantCdpAccess
-        })
-        .ok_or_else(|| AppError::not_found("CDP token"))?;
+    let claims = require_admin(&state, &headers, tenant_id).await?;
+    let _ = repo::revoke_token(&state.pool, tenant_id, token_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let raw = generate_token("jbr_cdp");
-    token.token_hash = hash_token(&raw);
-    token.token_prefix = raw.chars().take(12).collect();
-    token.revoked_at = None;
-    let response = TokenResponse::from(&*token);
-    store.audit_logs.push(AuditLog::new(
-        tenant_id,
-        "user",
-        claims.sub,
-        "token.created",
-        "web_ui",
-        None,
-    ));
-    Ok(Json(json!({ "data": response, "token": raw })))
+    let new_id = Uuid::now_v7();
+    let thash = hash_token(&raw);
+    let tprefix: String = raw.chars().take(12).collect();
+    repo::create_token(
+        &state.pool,
+        &repo::CreateToken {
+            id: new_id,
+            tenant_id,
+            token_type: "tenant_cdp_access",
+            name: None,
+            token_hash: &thash,
+            token_prefix: &tprefix,
+            created_by: Some(&claims.sub),
+        },
+    )
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let _ = repo::create_audit_log(
+        &state.pool,
+        &repo::CreateAuditLog {
+            id: Uuid::now_v7(),
+            tenant_id,
+            actor_type: "user",
+            actor_id: &claims.sub,
+            action: "token.rotated",
+            source: "web_ui",
+            resource_type: None,
+            resource_id: None,
+            browser_instance_id: None,
+            tab_id: None,
+            metadata: None,
+        },
+    )
+    .await;
+
+    Ok(Json(json!({
+        "data": {
+            "id": new_id,
+            "tenant_id": tenant_id,
+            "token_type": "tenant_cdp_access",
+            "token_prefix": tprefix,
+            "created_by": claims.sub,
+            "revoked_at": null,
+            "created_at": Utc::now()
+        },
+        "token": raw
+    })))
 }
+
+// ── Audit Logs ──────────────────────────────────────────────────────────
 
 async fn list_audit_logs(
     State(state): State<AppState>,
     Path(tenant_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
-    authorize(&state, &headers, Some(tenant_id)).await?;
-    let store = state.store.read().await;
-    let data = store
-        .audit_logs
+    require_admin(&state, &headers, tenant_id).await?;
+    let rows = repo::list_audit_logs(&state.pool, tenant_id, 200)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let data: Vec<Value> = rows
         .iter()
-        .filter(|log| log.tenant_id == tenant_id)
-        .cloned()
-        .collect::<Vec<_>>();
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "tenant_id": r.tenant_id,
+                "actor_type": r.actor_type,
+                "actor_id": r.actor_id,
+                "action": r.action,
+                "resource_type": r.resource_type,
+                "resource_id": r.resource_id,
+                "source": r.source,
+                "metadata": r.metadata,
+                "created_at": r.created_at
+            })
+        })
+        .collect();
     Ok(Json(json!({ "data": data })))
 }
+
+// ── Agent Registration ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct AgentRegisterRequest {
@@ -723,6 +1051,10 @@ struct AgentRegisterRequest {
     name: Option<String>,
     browser_type: Option<String>,
     browser_version: Option<String>,
+    /// If the agent already has a stable identity, send it back.
+    /// The control plane will reuse the same IDs and only refresh the runtime token.
+    agent_id: Option<String>,
+    browser_instance_id: Option<String>,
 }
 
 async fn agent_register(
@@ -730,28 +1062,98 @@ async fn agent_register(
     Json(req): Json<AgentRegisterRequest>,
 ) -> Result<Json<Value>, AppError> {
     let token_hash = hash_token(&req.registration_token);
-    let mut store = state.store.write().await;
-    let registration = store
-        .tokens
-        .values()
-        .find(|token| {
-            token.token_hash == token_hash
-                && token.token_type == TokenType::AgentRegistration
-                && token.revoked_at.is_none()
-        })
-        .cloned()
+    let registration = repo::get_token_by_hash(&state.pool, &token_hash)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
         .ok_or_else(|| AppError::unauthorized("invalid registration token"))?;
 
-    let agent_id = Uuid::now_v7();
-    let browser_id = Uuid::now_v7();
+    if registration.token_type != "agent_registration" {
+        return Err(AppError::unauthorized("invalid registration token"));
+    }
+
+    let tenant_id = Uuid::parse_str(&registration.tenant_id).unwrap();
     let runtime_token = generate_token("jbr_agent");
     let browser_type = req.browser_type.unwrap_or_else(|| "chromium".to_string());
     let browser_version = req.browser_version.unwrap_or_else(|| "unknown".to_string());
+
+    // ── Re-registration: agent already has a stable identity ────────────────
+    if let (Some(existing_agent_id_str), Some(existing_browser_id_str)) =
+        (req.agent_id.as_deref(), req.browser_instance_id.as_deref())
+    {
+        if let (Ok(existing_agent_id), Ok(existing_browser_id)) = (
+            Uuid::parse_str(existing_agent_id_str),
+            Uuid::parse_str(existing_browser_id_str),
+        ) {
+            // Verify the agent exists in DB and belongs to this tenant
+            if let Ok(Some(agent_row)) = repo::get_agent(&state.pool, tenant_id, existing_agent_id).await {
+                let agent_name = agent_row.name.clone().unwrap_or_else(|| format!("agent-{existing_agent_id}"));
+
+                // Refresh runtime token only
+                let _ = repo::update_agent_runtime_token(
+                    &state.pool,
+                    existing_agent_id,
+                    &hash_token(&runtime_token),
+                ).await;
+                let _ = repo::replace_agent_runtime_token(
+                    &state.pool,
+                    existing_agent_id,
+                    tenant_id,
+                    &hash_token(&runtime_token),
+                    &runtime_token.chars().take(12).collect::<String>(),
+                ).await;
+
+                // Reload into memory
+                let agent = AgentSummary {
+                    id: existing_agent_id,
+                    tenant_id,
+                    browser_instance_id: existing_browser_id,
+                    name: agent_name.clone(),
+                    status: AgentStatus::Offline,
+                    browser_type: browser_type.clone(),
+                    browser_version: browser_version.clone(),
+                    last_heartbeat_at: None,
+                };
+                let browser = BrowserInstance {
+                    id: existing_browser_id,
+                    tenant_id,
+                    agent_id: existing_agent_id,
+                    name: format!("{browser_type}-{existing_browser_id}"),
+                    status: BrowserStatus::Offline,
+                    browser_type: browser_type.clone(),
+                    browser_version: browser_version.clone(),
+                    active_tab_id: None,
+                    tabs: Vec::new(),
+                    proxy_enabled: false,
+                    viewport_width: DEFAULT_VIEWPORT_WIDTH,
+                    viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+                    viewer_count: 0,
+                    agent_name: agent_name.clone(),
+                    agent_status: AgentStatus::Offline,
+                    last_heartbeat_at: None,
+                };
+                state.agents.write().await.insert(existing_agent_id, agent);
+                state.browsers.write().await.insert(existing_browser_id, browser);
+
+                info!(%existing_agent_id, "agent re-registered with stable identity");
+                return Ok(Json(json!({
+                    "agent_id": existing_agent_id,
+                    "browser_instance_id": existing_browser_id,
+                    "agent_runtime_token": runtime_token
+                })));
+            }
+        }
+    }
+
+    // ── First-time registration: create new identity ─────────────────────────
+    let agent_id = Uuid::now_v7();
+    let browser_id = Uuid::now_v7();
+    let agent_name = req.name.unwrap_or_else(|| format!("agent-{agent_id}"));
+
     let agent = AgentSummary {
         id: agent_id,
-        tenant_id: registration.tenant_id,
+        tenant_id,
         browser_instance_id: browser_id,
-        name: req.name.unwrap_or_else(|| format!("agent-{agent_id}")),
+        name: agent_name.clone(),
         status: AgentStatus::Offline,
         browser_type: browser_type.clone(),
         browser_version: browser_version.clone(),
@@ -759,44 +1161,75 @@ async fn agent_register(
     };
     let browser = BrowserInstance {
         id: browser_id,
-        tenant_id: registration.tenant_id,
+        tenant_id,
         agent_id,
         name: format!("{browser_type}-{browser_id}"),
         status: BrowserStatus::Offline,
-        browser_type,
-        browser_version,
+        browser_type: browser_type.clone(),
+        browser_version: browser_version.clone(),
         active_tab_id: None,
         tabs: Vec::new(),
         proxy_enabled: false,
         viewport_width: DEFAULT_VIEWPORT_WIDTH,
         viewport_height: DEFAULT_VIEWPORT_HEIGHT,
         viewer_count: 0,
-        agent_name: agent.name.clone(),
+        agent_name: agent_name.clone(),
         agent_status: AgentStatus::Offline,
         last_heartbeat_at: None,
     };
-    store.audit_logs.push(AuditLog::new(
-        registration.tenant_id,
-        "agent",
-        agent_id.to_string(),
-        "agent.registered",
-        "agent",
-        Some(browser_id),
-    ));
-    store.agents.insert(agent_id, agent);
-    store.browsers.insert(browser_id, browser);
-    let runtime_record = TokenRecord {
-        id: Uuid::now_v7(),
-        tenant_id: registration.tenant_id,
-        token_type: TokenType::AgentRuntime,
-        name: Some(format!("runtime-{agent_id}")),
-        token_hash: hash_token(&runtime_token),
-        token_prefix: runtime_token.chars().take(12).collect(),
-        created_by: None,
-        revoked_at: None,
-        created_at: Utc::now(),
-    };
-    store.tokens.insert(runtime_record.id, runtime_record);
+
+    let _ = repo::create_agent(
+        &state.pool,
+        agent_id,
+        tenant_id,
+        browser_id,
+        &agent_name,
+        &hash_token(&runtime_token),
+    )
+    .await;
+    let _ = repo::create_browser_instance(
+        &state.pool,
+        browser_id,
+        tenant_id,
+        agent_id,
+        &browser_type,
+        &browser_version,
+    )
+    .await;
+    let runtime_record_id = Uuid::now_v7();
+    let _ = repo::create_token(
+        &state.pool,
+        &repo::CreateToken {
+            id: runtime_record_id,
+            tenant_id,
+            token_type: "agent_runtime",
+            name: Some(&format!("runtime-{agent_id}")),
+            token_hash: &hash_token(&runtime_token),
+            token_prefix: &runtime_token.chars().take(12).collect::<String>(),
+            created_by: None,
+        },
+    )
+    .await;
+    let _ = repo::create_audit_log(
+        &state.pool,
+        &repo::CreateAuditLog {
+            id: Uuid::now_v7(),
+            tenant_id,
+            actor_type: "agent",
+            actor_id: &agent_id.to_string(),
+            action: "agent.registered",
+            source: "agent",
+            resource_type: None,
+            resource_id: None,
+            browser_instance_id: Some(browser_id),
+            tab_id: None,
+            metadata: None,
+        },
+    )
+    .await;
+
+    state.agents.write().await.insert(agent_id, agent);
+    state.browsers.write().await.insert(browser_id, browser);
 
     Ok(Json(json!({
         "agent_id": agent_id,
@@ -804,6 +1237,8 @@ async fn agent_register(
         "agent_runtime_token": runtime_token
     })))
 }
+
+// ── Agent WebSocket ─────────────────────────────────────────────────────
 
 async fn ws_agent(
     State(state): State<AppState>,
@@ -813,27 +1248,22 @@ async fn ws_agent(
     let token =
         bearer_token(&headers).ok_or_else(|| AppError::unauthorized("missing agent token"))?;
     let token_hash = hash_token(token);
-    let store = state.store.read().await;
-    let token = store
-        .tokens
-        .values()
-        .find(|record| {
-            record.token_hash == token_hash
-                && record.token_type == TokenType::AgentRuntime
-                && record.revoked_at.is_none()
-        })
-        .cloned()
+    let token_row = repo::get_token_by_hash(&state.pool, &token_hash)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
         .ok_or_else(|| AppError::unauthorized("invalid agent token"))?;
-    // Derive agent_id from token name "runtime-{agent_id}"
-    let agent_id_from_token = token
+    if token_row.token_type != "agent_runtime" {
+        return Err(AppError::unauthorized("invalid agent token"));
+    }
+    let tenant_id = Uuid::parse_str(&token_row.tenant_id).unwrap();
+    let agent_id_from_token = token_row
         .name
         .as_deref()
         .and_then(|n| n.strip_prefix("runtime-"))
         .and_then(|s| Uuid::parse_str(s).ok());
-    drop(store);
     Ok(ws
         .on_upgrade(move |socket| {
-            handle_agent_socket(state, token.tenant_id, agent_id_from_token, socket)
+            handle_agent_socket(state, tenant_id, agent_id_from_token, socket)
         })
         .into_response())
 }
@@ -846,37 +1276,81 @@ async fn handle_agent_socket(
 ) {
     info!(%tenant_id, "agent websocket connected");
 
-    // Look up the exact agent using the hint from the runtime token name.
-    // Fall back to any agent for the tenant if the hint is unavailable.
     let (agent_id, browser_id) = {
-        let store = state.store.read().await;
-        let agent = agent_id_hint
-            .and_then(|id| store.agents.get(&id).cloned())
-            .or_else(|| {
-                store
-                    .agents
-                    .values()
-                    .find(|a| a.tenant_id == tenant_id)
-                    .cloned()
-            });
-        match agent {
-            Some(a) => (a.id, a.browser_instance_id),
-            None => {
-                info!(%tenant_id, "no agent found for tenant, closing socket");
-                return;
+        let agents = state.agents.read().await;
+        let found = agent_id_hint
+            .and_then(|id| agents.get(&id).cloned())
+            .or_else(|| agents.values().find(|a| a.tenant_id == tenant_id).cloned());
+        drop(agents);
+
+        if let Some(a) = found {
+            (a.id, a.browser_instance_id)
+        } else if let Some(hint_id) = agent_id_hint {
+            // Control plane may have restarted — try to restore agent from DB.
+            match repo::get_agent(&state.pool, tenant_id, hint_id).await {
+                Ok(Some(row)) => {
+                    let bid = Uuid::parse_str(&row.browser_instance_id).unwrap_or_else(|_| Uuid::now_v7());
+                    let agent_name = row.name.clone().unwrap_or_else(|| format!("agent-{hint_id}"));
+                    let browser_row = repo::get_browser_instance(&state.pool, tenant_id, bid).await.ok().flatten();
+                    let (btype, bver) = browser_row.as_ref().map(|b| (b.browser_type.clone(), b.browser_version.clone().unwrap_or_else(|| "unknown".to_string()))).unwrap_or_else(|| ("chromium".to_string(), "unknown".to_string()));
+                    let agent = AgentSummary {
+                        id: hint_id,
+                        tenant_id,
+                        browser_instance_id: bid,
+                        name: agent_name.clone(),
+                        status: AgentStatus::Offline,
+                        browser_type: btype.clone(),
+                        browser_version: bver.clone(),
+                        last_heartbeat_at: None,
+                    };
+                    let browser = BrowserInstance {
+                        id: bid,
+                        tenant_id,
+                        agent_id: hint_id,
+                        name: format!("{btype}-{bid}"),
+                        status: BrowserStatus::Offline,
+                        browser_type: btype.clone(),
+                        browser_version: bver.clone(),
+                        active_tab_id: None,
+                        tabs: Vec::new(),
+                        proxy_enabled: false,
+                        viewport_width: DEFAULT_VIEWPORT_WIDTH,
+                        viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+                        viewer_count: 0,
+                        agent_name,
+                        agent_status: AgentStatus::Offline,
+                        last_heartbeat_at: None,
+                    };
+                    state.agents.write().await.insert(hint_id, agent);
+                    state.browsers.write().await.insert(bid, browser);
+                    info!(%hint_id, "agent restored from DB into memory");
+                    (hint_id, bid)
+                }
+                _ => {
+                    info!(%tenant_id, %hint_id, "agent not found in memory or DB, closing socket");
+                    return;
+                }
             }
+        } else {
+            info!(%tenant_id, "no agent found for tenant, closing socket");
+            return;
         }
     };
 
-    // Create per-browser video channel
     let (bcast_tx, _) = broadcast::channel::<Vec<u8>>(128);
-    state.browser_preview.write().await.insert(browser_id, bcast_tx.clone());
+    state
+        .browser_preview
+        .write()
+        .await
+        .insert(browser_id, bcast_tx.clone());
 
-    // Create per-browser event channel (tab.list etc.)
     let (event_tx, _) = broadcast::channel::<String>(64);
-    state.browser_events.write().await.insert(browser_id, event_tx.clone());
+    state
+        .browser_events
+        .write()
+        .await
+        .insert(browser_id, event_tx.clone());
 
-    // Create per-agent command channel
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
     state.agent_senders.write().await.insert(agent_id, cmd_tx);
 
@@ -884,14 +1358,12 @@ async fn handle_agent_socket(
 
     loop {
         tokio::select! {
-            // Messages from agent → process heartbeats / video frames
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
                             let msg_type = value.get("type").and_then(Value::as_str);
 
-                            // Route CDP tunnel responses back to the CDP client
                             if msg_type == Some("cdp.tunnel.message") {
                                 if let Some(payload) = value.get("payload") {
                                     if let (Some(session_id), Some(data)) = (
@@ -906,7 +1378,6 @@ async fn handle_agent_socket(
                                 }
                             }
 
-                            // Broadcast tab.list events to subscribed frontend clients
                             if msg_type == Some("tab.list") {
                                 let _ = event_tx.send(text.clone());
                             }
@@ -918,7 +1389,6 @@ async fn handle_agent_socket(
                             let subs = bcast_tx.receiver_count();
                             let _ = bcast_tx.send(bytes.clone());
                             let _ = state.preview_tx.send(bytes.clone());
-                            // Cache last frame for immediate delivery on subscribe
                             state.browser_last_frame.write().await.insert(browser_id, bytes);
                             tracing::debug!(seq = _frame.sequence, subs, "video frame relayed");
                         }
@@ -927,7 +1397,6 @@ async fn handle_agent_socket(
                     _ => {}
                 }
             }
-            // Commands from control plane → forward to agent
             Some(cmd) = cmd_rx.recv() => {
                 if ws_tx.send(Message::Text(cmd)).await.is_err() {
                     break;
@@ -936,46 +1405,58 @@ async fn handle_agent_socket(
         }
     }
 
-    // Cleanup on disconnect
+    // Cleanup on disconnect — in-memory only
     state.agent_senders.write().await.remove(&agent_id);
     state.browser_preview.write().await.remove(&browser_id);
     state.browser_last_frame.write().await.remove(&browser_id);
     state.browser_events.write().await.remove(&browser_id);
-    let mut store = state.store.write().await;
-    if let Some(a) = store.agents.get_mut(&agent_id) {
-        a.status = AgentStatus::Offline;
+    {
+        let mut agents = state.agents.write().await;
+        if let Some(a) = agents.get_mut(&agent_id) {
+            a.status = AgentStatus::Offline;
+        }
     }
-    if let Some(b) = store.browsers.get_mut(&browser_id) {
-        b.status = BrowserStatus::Offline;
-        b.agent_status = AgentStatus::Offline;
+    {
+        let mut browsers = state.browsers.write().await;
+        if let Some(b) = browsers.get_mut(&browser_id) {
+            b.status = BrowserStatus::Offline;
+            b.agent_status = AgentStatus::Offline;
+        }
     }
     info!(%tenant_id, %agent_id, "agent websocket disconnected");
 }
 
 async fn handle_agent_text(state: &AppState, agent_id: Uuid, browser_id: Uuid, value: Value) {
     let now = Utc::now().to_rfc3339();
-    let mut store = state.store.write().await;
-    if let Some(agent) = store.agents.get_mut(&agent_id) {
-        agent.status = AgentStatus::Online;
-        agent.last_heartbeat_at = Some(now.clone());
+    {
+        let mut agents = state.agents.write().await;
+        if let Some(agent) = agents.get_mut(&agent_id) {
+            agent.status = AgentStatus::Online;
+            agent.last_heartbeat_at = Some(now.clone());
+        }
     }
-    if let Some(browser) = store.browsers.get_mut(&browser_id) {
-        browser.status = BrowserStatus::Online;
-        browser.agent_status = AgentStatus::Online;
-        browser.last_heartbeat_at = Some(now.clone());
-        if value.get("type").and_then(Value::as_str) == Some("tab.list") {
-            if let Some(tabs) = value.get("payload").and_then(|payload| payload.get("tabs")) {
-                if let Ok(parsed) = serde_json::from_value::<Vec<BrowserTab>>(tabs.clone()) {
-                    browser.active_tab_id = parsed
-                        .iter()
-                        .find(|tab| tab.active)
-                        .map(|tab| tab.id.clone());
-                    browser.tabs = parsed;
+    {
+        let mut browsers = state.browsers.write().await;
+        if let Some(browser) = browsers.get_mut(&browser_id) {
+            browser.status = BrowserStatus::Online;
+            browser.agent_status = AgentStatus::Online;
+            browser.last_heartbeat_at = Some(now);
+            if value.get("type").and_then(Value::as_str) == Some("tab.list") {
+                if let Some(tabs) = value.get("payload").and_then(|payload| payload.get("tabs")) {
+                    if let Ok(parsed) = serde_json::from_value::<Vec<BrowserTab>>(tabs.clone()) {
+                        browser.active_tab_id = parsed
+                            .iter()
+                            .find(|tab| tab.active)
+                            .map(|tab| tab.id.clone());
+                        browser.tabs = parsed;
+                    }
                 }
             }
         }
     }
 }
+
+// ── Control WebSocket ───────────────────────────────────────────────────
 
 async fn ws_control(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_control_socket(state, socket))
@@ -1031,30 +1512,21 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
         }
     };
 
-    // Per-browser video subscription, updated when client sends browser.subscribe
     let mut current_browser_id: Option<Uuid> = None;
     let mut preview_rx: Option<broadcast::Receiver<Vec<u8>>> = None;
     let mut events_rx: Option<broadcast::Receiver<String>> = None;
 
     loop {
-        // Build future for video segment (only if subscribed)
         let video_fut = async {
             match preview_rx.as_mut() {
-                Some(rx) => match rx.recv().await {
-                    Ok(bytes) => Some(bytes),
-                    Err(_) => None, // lagged or channel closed → just skip
-                },
+                Some(rx) => rx.recv().await.ok(),
                 None => std::future::pending().await,
             }
         };
 
-        // Build future for browser events (tab.list etc.)
         let event_fut = async {
             match events_rx.as_mut() {
-                Some(rx) => match rx.recv().await {
-                    Ok(msg) => Some(msg),
-                    Err(_) => None,
-                },
+                Some(rx) => rx.recv().await.ok(),
                 None => std::future::pending().await,
             }
         };
@@ -1062,7 +1534,6 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
         tokio::select! {
             Some(Ok(message)) = receiver.next() => {
                 if let Message::Text(text) = message {
-                    // Check if this is a browser.subscribe to update preview channel
                     if let Ok(parsed) = serde_json::from_str::<ClientMessage>(&text) {
                         if parsed.kind == "browser.subscribe" {
                             tracing::debug!(payload = %parsed.payload, "browser.subscribe received");
@@ -1071,15 +1542,12 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                                 .and_then(|id| Uuid::parse_str(id).ok())
                             {
                                 current_browser_id = Some(bid);
-                                // Subscribe to per-browser preview channel if available
                                 let map = state.browser_preview.read().await;
                                 let found = map.contains_key(&bid);
                                 tracing::debug!(%bid, found, keys = ?map.keys().collect::<Vec<_>>(), "control client subscribing to browser preview");
                                 preview_rx = map.get(&bid).map(|tx| tx.subscribe());
-                                // Subscribe to per-browser event channel
                                 let ev_map = state.browser_events.read().await;
                                 events_rx = ev_map.get(&bid).map(|tx| tx.subscribe());
-                                // Send cached last frame immediately so client doesn't wait
                                 let last = state.browser_last_frame.read().await;
                                 if let Some(frame) = last.get(&bid) {
                                     let _ = sender.send(Message::Binary(frame.clone())).await;
@@ -1091,7 +1559,6 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                 }
             }
             Some(event_json) = event_fut => {
-                // Forward tab.list / browser events to subscribed frontend client
                 if sender.send(Message::Text(event_json)).await.is_err() {
                     return;
                 }
@@ -1100,10 +1567,9 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                 if sender.send(Message::Binary(bytes)).await.is_err() {
                     return;
                 }
-                // Refresh subscription if the channel was recreated (agent reconnected)
                 if let Some(bid) = current_browser_id {
-                    if preview_rx.as_mut().map(|rx| rx.len() == 0).unwrap_or(false) {
-                        // still valid, do nothing
+                    if preview_rx.as_mut().map(|rx| rx.is_empty()).unwrap_or(false) {
+                        // still valid
                     } else {
                         let map = state.browser_preview.read().await;
                         if let Some(tx) = map.get(&bid) {
@@ -1151,8 +1617,8 @@ async fn handle_control_text(
                 .await;
                 return;
             };
-            let store = state.store.read().await;
-            if let Some(browser) = store.browsers.get(&browser_id).filter(|browser| {
+            let browsers = state.browsers.read().await;
+            if let Some(browser) = browsers.get(&browser_id).filter(|browser| {
                 claims
                     .tenants
                     .iter()
@@ -1167,8 +1633,8 @@ async fn handle_control_text(
                 .await;
             }
         }
-        "input.event" | "tab.command" | "browser.reset" | "navigate.url" | "navigate.back" | "navigate.forward" | "navigate.reload" => {
-            // Resolve target browser
+        "input.event" | "tab.command" | "browser.reset" | "navigate.url" | "navigate.back"
+        | "navigate.forward" | "navigate.reload" => {
             let browser_id = message
                 .payload
                 .get("browserInstanceId")
@@ -1176,38 +1642,43 @@ async fn handle_control_text(
                 .and_then(|id| Uuid::parse_str(id).ok())
                 .or(current_browser_id);
 
-            let mut store = state.store.write().await;
             if let Some(tenant) = claims.tenants.first() {
-                store.audit_logs.push(AuditLog::new(
-                    tenant.id,
-                    "user",
-                    claims.sub.clone(),
-                    match message.kind.as_str() {
-                        "input.event" => "input.dispatched",
-                        "tab.command" => "tab.command_requested",
-                        "navigate.url" | "navigate.back" | "navigate.forward" | "navigate.reload" => "navigate.requested",
-                        _ => "browser.reset_requested",
+                let _ = repo::create_audit_log(
+                    &state.pool,
+                    &repo::CreateAuditLog {
+                        id: Uuid::now_v7(),
+                        tenant_id: tenant.id,
+                        actor_type: "user",
+                        actor_id: &claims.sub,
+                        action: match message.kind.as_str() {
+                            "input.event" => "input.dispatched",
+                            "tab.command" => "tab.command_requested",
+                            "navigate.url" | "navigate.back" | "navigate.forward"
+                            | "navigate.reload" => "navigate.requested",
+                            _ => "browser.reset_requested",
+                        },
+                        source: "web_ui",
+                        resource_type: None,
+                        resource_id: None,
+                        browser_instance_id: None,
+                        tab_id: None,
+                        metadata: None,
                     },
-                    "web_ui",
-                    None,
-                ));
+                )
+                .await;
             }
 
-            // Forward command to agent if we know which browser/agent
             if let Some(bid) = browser_id {
-                if let Some(browser) = store.browsers.get(&bid) {
+                let browsers = state.browsers.read().await;
+                if let Some(browser) = browsers.get(&bid) {
                     let agent_id = browser.agent_id;
-                    drop(store);
+                    drop(browsers);
                     let senders = state.agent_senders.read().await;
                     if let Some(tx) = senders.get(&agent_id) {
                         let cmd = serde_json::to_string(&message).unwrap_or_default();
                         let _ = tx.try_send(cmd);
                     }
-                } else {
-                    drop(store);
                 }
-            } else {
-                drop(store);
             }
 
             let _ = send_json(
@@ -1237,6 +1708,8 @@ async fn send_json(
         .await
 }
 
+// ── CDP Proxy ───────────────────────────────────────────────────────────
+
 #[derive(Debug, Deserialize)]
 struct CdpQuery {
     token: String,
@@ -1248,9 +1721,8 @@ async fn cdp_json_version(
     Query(query): Query<CdpQuery>,
 ) -> Result<Json<Value>, AppError> {
     validate_cdp_token(&state, tenant_id, &query.token).await?;
-    let store = state.store.read().await;
-    let browser = store
-        .browsers
+    let browsers = state.browsers.read().await;
+    let browser = browsers
         .get(&browser_id)
         .filter(|browser| browser.tenant_id == tenant_id)
         .ok_or_else(|| AppError::not_found("browser instance"))?;
@@ -1274,9 +1746,8 @@ async fn cdp_json_list(
     Query(query): Query<CdpQuery>,
 ) -> Result<Json<Value>, AppError> {
     validate_cdp_token(&state, tenant_id, &query.token).await?;
-    let store = state.store.read().await;
-    let browser = store
-        .browsers
+    let browsers = state.browsers.read().await;
+    let browser = browsers
         .get(&browser_id)
         .filter(|browser| browser.tenant_id == tenant_id)
         .ok_or_else(|| AppError::not_found("browser instance"))?;
@@ -1305,18 +1776,15 @@ async fn cdp_ws_tunnel(
 ) -> Result<Response, AppError> {
     validate_cdp_token(&state, tenant_id, &query.token).await?;
 
-    // Resolve agent_id for this browser instance
     let agent_id = {
-        let store = state.store.read().await;
-        let browser = store
-            .browsers
+        let browsers = state.browsers.read().await;
+        let browser = browsers
             .get(&browser_id)
             .filter(|b| b.tenant_id == tenant_id)
             .ok_or_else(|| AppError::not_found("browser instance"))?;
         browser.agent_id
     };
 
-    // Check the agent is connected
     {
         let senders = state.agent_senders.read().await;
         if !senders.contains_key(&agent_id) {
@@ -1325,34 +1793,24 @@ async fn cdp_ws_tunnel(
     }
 
     Ok(ws
-        .on_upgrade(move |socket| {
-            handle_cdp_tunnel(state, agent_id, target_id, socket)
-        })
+        .on_upgrade(move |socket| handle_cdp_tunnel(state, agent_id, target_id, socket))
         .into_response())
 }
 
-async fn handle_cdp_tunnel(
-    state: AppState,
-    agent_id: Uuid,
-    target_id: String,
-    socket: WebSocket,
-) {
+async fn handle_cdp_tunnel(state: AppState, agent_id: Uuid, target_id: String, socket: WebSocket) {
     let session_id = Uuid::now_v7().to_string();
     info!(%session_id, %agent_id, %target_id, "CDP tunnel session opening");
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Channel for receiving CDP responses from the agent
     let (response_tx, mut response_rx) = mpsc::channel::<String>(256);
 
-    // Register this tunnel session so the agent handler can route responses back
     state
         .cdp_tunnel_senders
         .write()
         .await
         .insert(session_id.clone(), response_tx);
 
-    // Tell the agent to open a CDP connection for this target
     {
         let senders = state.agent_senders.read().await;
         if let Some(tx) = senders.get(&agent_id) {
@@ -1367,10 +1825,8 @@ async fn handle_cdp_tunnel(
         }
     }
 
-    // Bidirectional forwarding loop
     loop {
         tokio::select! {
-            // CDP client → agent
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -1387,14 +1843,13 @@ async fn handle_cdp_tunnel(
                                 break;
                             }
                         } else {
-                            break; // agent disconnected
+                            break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
             }
-            // Agent → CDP client
             Some(response) = response_rx.recv() => {
                 if ws_tx.send(Message::Text(response)).await.is_err() {
                     break;
@@ -1403,7 +1858,6 @@ async fn handle_cdp_tunnel(
         }
     }
 
-    // Tell the agent to close the CDP connection
     {
         let senders = state.agent_senders.read().await;
         if let Some(tx) = senders.get(&agent_id) {
@@ -1415,25 +1869,24 @@ async fn handle_cdp_tunnel(
         }
     }
 
-    // Cleanup
     state.cdp_tunnel_senders.write().await.remove(&session_id);
     info!(%session_id, "CDP tunnel session closed");
 }
 
 async fn validate_cdp_token(state: &AppState, tenant_id: Uuid, raw: &str) -> Result<(), AppError> {
     let hash = hash_token(raw);
-    let store = state.store.read().await;
-    store
-        .tokens
-        .values()
-        .find(|token| {
-            token.tenant_id == tenant_id
-                && token.token_type == TokenType::TenantCdpAccess
-                && token.token_hash == hash
-                && token.revoked_at.is_none()
-        })
-        .map(|_| ())
-        .ok_or_else(|| AppError::unauthorized("invalid CDP token"))
+    let token = repo::get_token_by_hash(&state.pool, &hash)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    match token {
+        Some(t)
+            if t.token_type == "tenant_cdp_access"
+                && Uuid::parse_str(&t.tenant_id).ok() == Some(tenant_id) =>
+        {
+            Ok(())
+        }
+        _ => Err(AppError::unauthorized("invalid CDP token")),
+    }
 }
 
 fn ws_base_url(public_base_url: &str) -> String {
@@ -1441,6 +1894,407 @@ fn ws_base_url(public_base_url: &str) -> String {
         .replace("https://", "wss://")
         .replace("http://", "ws://")
 }
+
+// ── Invitation Handlers ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateInvitationRequest {
+    role: Option<String>,
+}
+
+async fn create_invitation(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<CreateInvitationRequest>,
+) -> Result<Json<Value>, AppError> {
+    let claims = require_admin(&state, &headers, tenant_id).await?;
+    let role = req.role.unwrap_or_else(|| "member".to_string());
+    if role != "admin" && role != "member" {
+        return Err(AppError::bad_request("role must be admin or member"));
+    }
+    let id = Uuid::now_v7();
+    let raw_token = generate_token("jbr_inv");
+    let token_hash = hash_token(&raw_token);
+    let prefix: String = raw_token.chars().take(8).collect();
+    let expires_at = Utc::now() + ChronoDuration::days(7);
+    let user_id = Uuid::parse_str(&claims.sub).unwrap();
+    repo::create_invitation(
+        &state.pool,
+        &repo::CreateInvitation {
+            id,
+            tenant_id,
+            token_hash: &token_hash,
+            token_prefix: &prefix,
+            role: &role,
+            created_by: user_id,
+            expires_at,
+        },
+    )
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    let invite_link = format!("{}/invite/{}", state.config.public_base_url, raw_token);
+    Ok(Json(json!({
+        "id": id,
+        "invite_link": invite_link,
+        "token": raw_token,
+        "role": role,
+        "created_by": claims.sub,
+        "expires_at": expires_at
+    })))
+}
+
+async fn list_invitations(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&state, &headers, tenant_id).await?;
+    let rows = repo::list_invitations_by_tenant(&state.pool, tenant_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({
+        "data": rows.iter().map(|r| json!({
+            "id": r.id,
+            "role": r.role,
+            "token_prefix": r.token_prefix,
+            "created_by": r.created_by,
+            "accepted_by": r.accepted_by,
+            "accepted_at": r.accepted_at,
+            "expires_at": r.expires_at,
+            "created_at": r.created_at
+        })).collect::<Vec<_>>()
+    })))
+}
+
+async fn delete_invitation_handler(
+    State(state): State<AppState>,
+    Path((tenant_id, invitation_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    require_admin(&state, &headers, tenant_id).await?;
+    let deleted = repo::delete_invitation(&state.pool, tenant_id, invitation_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::not_found("invitation"))
+    }
+}
+
+async fn validate_invitation(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let token_hash = hash_token(&token);
+    let inv = repo::get_invitation_by_token_hash(&state.pool, &token_hash)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    match inv {
+        Some(row) => Ok(Json(json!({
+            "valid": true,
+            "tenant_name": row.tenant_name,
+            "role": row.role
+        }))),
+        None => Ok(Json(json!({ "valid": false }))),
+    }
+}
+
+async fn accept_invitation(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let claims = authorize(&state, &headers, None).await?;
+    let user_id = Uuid::parse_str(&claims.sub).unwrap();
+    let token_hash = hash_token(&token);
+    let inv = repo::get_invitation_by_token_hash(&state.pool, &token_hash)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .ok_or(AppError::bad_request("invalid or expired invitation"))?;
+    let tenant_id = Uuid::parse_str(&inv.tenant_id).unwrap();
+    let inv_id = Uuid::parse_str(&inv.id).unwrap();
+    if repo::get_member_role(&state.pool, tenant_id, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .is_some()
+    {
+        return Err(AppError::bad_request("already a member of this tenant"));
+    }
+    repo::add_tenant_member(&state.pool, tenant_id, user_id, &inv.role)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    repo::accept_invitation(&state.pool, inv_id, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let tenant_rows = repo::get_user_tenants(&state.pool, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let tenants_claim: Vec<TenantClaim> = tenant_rows
+        .iter()
+        .map(|t| TenantClaim {
+            id: Uuid::parse_str(&t.id).unwrap(),
+            role: t.role.clone(),
+        })
+        .collect();
+    let user_row = repo::get_user_by_id(&state.pool, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .unwrap();
+    let user = User {
+        id: user_id,
+        email: user_row.email,
+        display_name: user_row.display_name.unwrap_or_default(),
+        password_hash: user_row.password_hash,
+        tenants: tenants_claim,
+    };
+    let access_token = issue_jwt(&state.config.jwt_secret, &user)?;
+    Ok(Json(json!({ "access_token": access_token })))
+}
+
+// ── Member Handlers ─────────────────────────────────────────────────────
+
+async fn list_members_handler(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    authorize(&state, &headers, Some(tenant_id)).await?;
+    let rows = repo::list_members(&state.pool, tenant_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({
+        "members": rows.iter().map(|r| json!({
+            "user_id": r.user_id,
+            "email": r.email,
+            "display_name": r.display_name,
+            "role": r.role,
+            "joined_at": r.joined_at
+        })).collect::<Vec<_>>()
+    })))
+}
+
+#[derive(Deserialize)]
+struct UpdateRoleRequest {
+    role: String,
+}
+
+async fn update_member_role_handler(
+    State(state): State<AppState>,
+    Path((tenant_id, target_user_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateRoleRequest>,
+) -> Result<Json<Value>, AppError> {
+    let claims = require_admin(&state, &headers, tenant_id).await?;
+    if req.role != "admin" && req.role != "member" {
+        return Err(AppError::bad_request("role must be admin or member"));
+    }
+    let caller_id = Uuid::parse_str(&claims.sub).unwrap();
+    if caller_id == target_user_id {
+        return Err(AppError::bad_request("cannot change your own role"));
+    }
+    if req.role == "member" {
+        let admin_count = repo::count_admins(&state.pool, tenant_id)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        let current_role = repo::get_member_role(&state.pool, tenant_id, target_user_id)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        if current_role.as_deref() == Some("admin") && admin_count <= 1 {
+            return Err(AppError::bad_request("cannot demote the last admin"));
+        }
+    }
+    repo::update_member_role(&state.pool, tenant_id, target_user_id, &req.role)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({"message": "role updated"})))
+}
+
+async fn remove_member(
+    State(state): State<AppState>,
+    Path((tenant_id, target_user_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    let claims = require_admin(&state, &headers, tenant_id).await?;
+    let caller_id = Uuid::parse_str(&claims.sub).unwrap();
+    if caller_id == target_user_id {
+        return Err(AppError::bad_request(
+            "cannot remove yourself, use leave instead",
+        ));
+    }
+    let removed = repo::remove_tenant_member(&state.pool, tenant_id, target_user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::not_found("member"))
+    }
+}
+
+async fn leave_tenant(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    let claims = authorize(&state, &headers, Some(tenant_id)).await?;
+    let user_id = Uuid::parse_str(&claims.sub).unwrap();
+    let role = repo::get_member_role(&state.pool, tenant_id, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .ok_or(AppError::not_found("membership"))?;
+    if role == "admin" {
+        let count = repo::count_admins(&state.pool, tenant_id)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        if count <= 1 {
+            return Err(AppError::bad_request(
+                "cannot leave: you are the last admin",
+            ));
+        }
+    }
+    repo::remove_tenant_member(&state.pool, tenant_id, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Tenant Management ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct UpdateTenantRequest {
+    name: String,
+}
+
+// ── Tenant: Create ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateTenantRequest {
+    name: String,
+}
+
+async fn create_tenant_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateTenantRequest>,
+) -> Result<Json<Value>, AppError> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::bad_request("tenant name cannot be empty"));
+    }
+    let claims = authorize(&state, &headers, None).await?;
+    let user_id = Uuid::parse_str(&claims.sub).unwrap();
+    let tenant_id = Uuid::now_v7();
+    let slug = generate_slug(&name);
+    repo::create_tenant(&state.pool, tenant_id, &name, &slug)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    repo::add_tenant_member(&state.pool, tenant_id, user_id, "admin")
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    // Return fresh token with the new tenant included
+    let tenant_rows = repo::get_user_tenants(&state.pool, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let tenants_claim: Vec<TenantClaim> = tenant_rows
+        .iter()
+        .map(|t| TenantClaim { id: Uuid::parse_str(&t.id).unwrap(), role: t.role.clone() })
+        .collect();
+    let user_row = repo::get_user_by_id(&state.pool, user_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .ok_or(AppError::unauthorized("user not found"))?;
+    let user = User {
+        id: user_id,
+        email: user_row.email.clone(),
+        display_name: user_row.display_name.clone().unwrap_or_default(),
+        password_hash: user_row.password_hash.clone(),
+        tenants: tenants_claim,
+    };
+    let access_token = issue_jwt(&state.config.jwt_secret, &user)?;
+    let tenants_resp: Vec<Tenant> = tenant_rows
+        .iter()
+        .map(|t| Tenant {
+            id: Uuid::parse_str(&t.id).unwrap(),
+            name: t.name.clone(),
+            slug: t.slug.clone(),
+            role: t.role.clone(),
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "tenant": {
+            "id": tenant_id,
+            "name": name,
+            "slug": slug,
+            "role": "admin"
+        },
+        "tenants": tenants_resp
+    })))
+}
+
+async fn update_tenant_handler(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateTenantRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&state, &headers, tenant_id).await?;
+    repo::update_tenant(&state.pool, tenant_id, &req.name)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({"message": "tenant updated"})))
+}
+
+async fn delete_tenant_handler(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    require_admin(&state, &headers, tenant_id).await?;
+    {
+        let browsers = state.browsers.read().await;
+        let browser_ids: Vec<Uuid> = browsers
+            .values()
+            .filter(|b| b.tenant_id == tenant_id)
+            .map(|b| b.id)
+            .collect();
+        let agent_ids: Vec<Uuid> = browsers
+            .values()
+            .filter(|b| b.tenant_id == tenant_id)
+            .map(|b| b.agent_id)
+            .collect();
+        drop(browsers);
+        state
+            .browsers
+            .write()
+            .await
+            .retain(|_, b| b.tenant_id != tenant_id);
+        state
+            .agents
+            .write()
+            .await
+            .retain(|_, a| a.tenant_id != tenant_id);
+        for bid in &browser_ids {
+            state.browser_preview.write().await.remove(bid);
+            state.browser_last_frame.write().await.remove(bid);
+            state.browser_events.write().await.remove(bid);
+        }
+        for aid in &agent_ids {
+            state.agent_senders.write().await.remove(aid);
+        }
+    }
+    repo::delete_tenant(&state.pool, tenant_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Auth / RBAC Helpers ─────────────────────────────────────────────────
 
 async fn authorize(
     state: &AppState,
@@ -1458,6 +2312,22 @@ async fn authorize(
     Ok(claims)
 }
 
+async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_id: Uuid,
+) -> Result<JwtClaims, AppError> {
+    let claims = authorize(state, headers, Some(tenant_id)).await?;
+    let is_admin = claims
+        .tenants
+        .iter()
+        .any(|t| t.id == tenant_id && t.role == "admin");
+    if !is_admin {
+        return Err(AppError::forbidden("admin role required"));
+    }
+    Ok(claims)
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)?
@@ -1465,6 +2335,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .ok()?
         .strip_prefix("Bearer ")
 }
+
+// ── Crypto Helpers ──────────────────────────────────────────────────────
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -1519,6 +2391,23 @@ fn decode_jwt(secret: &str, token: &str) -> Result<JwtClaims, AppError> {
     .map_err(|_| AppError::unauthorized("invalid bearer token"))
 }
 
+// ── Token Row → Response helper ─────────────────────────────────────────
+
+fn token_row_to_response(row: &repo::TokenRow) -> Value {
+    json!({
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "token_type": row.token_type,
+        "name": row.name,
+        "token_prefix": row.token_prefix,
+        "created_by": row.created_by,
+        "revoked_at": row.revoked_at,
+        "created_at": row.created_at
+    })
+}
+
+// ── Domain Types ────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JwtClaims {
     sub: String,
@@ -1539,6 +2428,7 @@ struct Tenant {
     id: Uuid,
     name: String,
     slug: String,
+    role: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1546,6 +2436,7 @@ struct User {
     id: Uuid,
     email: String,
     display_name: String,
+    #[allow(dead_code)]
     password_hash: String,
     tenants: Vec<TenantClaim>,
 }
@@ -1557,97 +2448,7 @@ struct UserResponse {
     display_name: String,
 }
 
-impl From<User> for UserResponse {
-    fn from(user: User) -> Self {
-        Self {
-            id: user.id,
-            email: user.email,
-            display_name: user.display_name,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TokenType {
-    AgentRegistration,
-    AgentRuntime,
-    TenantCdpAccess,
-}
-
-#[derive(Debug, Clone)]
-struct TokenRecord {
-    id: Uuid,
-    tenant_id: Uuid,
-    token_type: TokenType,
-    name: Option<String>,
-    token_hash: String,
-    token_prefix: String,
-    created_by: Option<String>,
-    revoked_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-struct TokenResponse {
-    id: Uuid,
-    tenant_id: Uuid,
-    token_type: TokenType,
-    name: Option<String>,
-    token_prefix: String,
-    created_by: Option<String>,
-    revoked_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-}
-
-impl From<&TokenRecord> for TokenResponse {
-    fn from(token: &TokenRecord) -> Self {
-        Self {
-            id: token.id,
-            tenant_id: token.tenant_id,
-            token_type: token.token_type,
-            name: token.name.clone(),
-            token_prefix: token.token_prefix.clone(),
-            created_by: token.created_by.clone(),
-            revoked_at: token.revoked_at,
-            created_at: token.created_at,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AuditLog {
-    id: Uuid,
-    tenant_id: Uuid,
-    actor_type: String,
-    actor_id: String,
-    action: String,
-    source: String,
-    browser_instance_id: Option<Uuid>,
-    created_at: DateTime<Utc>,
-}
-
-impl AuditLog {
-    fn new(
-        tenant_id: Uuid,
-        actor_type: impl Into<String>,
-        actor_id: impl Into<String>,
-        action: impl Into<String>,
-        source: impl Into<String>,
-        browser_instance_id: Option<Uuid>,
-    ) -> Self {
-        Self {
-            id: Uuid::now_v7(),
-            tenant_id,
-            actor_type: actor_type.into(),
-            actor_id: actor_id.into(),
-            action: action.into(),
-            source: source.into(),
-            browser_instance_id,
-            created_at: Utc::now(),
-        }
-    }
-}
+// ── Error Type ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -1721,6 +2522,8 @@ impl IntoResponse for AppError {
     }
 }
 
+// ── Tests ───────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1752,5 +2555,24 @@ mod tests {
 
         assert_eq!(hash, hash_token(token));
         assert_ne!(hash, token);
+    }
+
+    #[test]
+    fn generate_slug_basic() {
+        let slug = generate_slug("Alice Smith");
+        assert!(slug.starts_with("alice-smith-"));
+        assert_eq!(slug.len(), "alice-smith-".len() + 3);
+    }
+
+    #[test]
+    fn generate_slug_empty() {
+        let slug = generate_slug("");
+        assert!(slug.starts_with("workspace-"));
+    }
+
+    #[test]
+    fn generate_slug_special_chars() {
+        let slug = generate_slug("Hello! @World#");
+        assert!(slug.starts_with("hello-world-"));
     }
 }

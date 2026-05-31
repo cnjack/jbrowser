@@ -18,6 +18,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.control
+      network: host
     environment:
       JWT_SECRET: dev-secret-change-me
       DATABASE_URL: mysql://root:jbrowser@mysql:3306/jbrowser
@@ -37,6 +38,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.agent-chromium
+      network: host
     environment:
       CONTROL_PLANE_HTTP_URL: http://control:8080
       CONTROL_PLANE_WS_URL: ws://control:8080

@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, sync::OnceLock, time::Duration, collections::HashMap};
+use std::{collections::HashMap, env, path::PathBuf, sync::OnceLock, time::Duration};
 
 use anyhow::Context;
 use base64::Engine;
@@ -32,9 +32,10 @@ fn input_tx() -> Option<&'static mpsc::Sender<serde_json::Value>> {
 // ── Global CDP tunnel sessions ─────────────────────────────────────────────
 // Maps session_id → mpsc::Sender<String> for forwarding CDP messages to Chrome.
 // Each tunnel session is a tokio task that holds a CDP WebSocket to Chrome.
-static CDP_TUNNELS: OnceLock<Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>> = OnceLock::new();
+type CdpTunnelMap = Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>;
+static CDP_TUNNELS: OnceLock<CdpTunnelMap> = OnceLock::new();
 
-fn cdp_tunnels() -> &'static Arc<RwLock<HashMap<String, mpsc::Sender<String>>>> {
+fn cdp_tunnels() -> &'static CdpTunnelMap {
     CDP_TUNNELS.get().expect("CDP_TUNNELS not set")
 }
 
@@ -99,7 +100,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Active tab watch channel: screencast + input loops reconnect when this changes
     let (active_tab_tx, _) = watch::channel::<Option<String>>(None);
-    ACTIVE_TAB_TX.set(active_tab_tx).expect("ACTIVE_TAB_TX already set");
+    ACTIVE_TAB_TX
+        .set(active_tab_tx)
+        .expect("ACTIVE_TAB_TX already set");
 
     // Persistent input channel: all input/navigate commands go through here
     // to avoid creating a new CDP WS connection per event.
@@ -150,8 +153,7 @@ impl AgentConfig {
                 .into(),
             agent_name: env::var("AGENT_NAME").unwrap_or_else(|_| "chromium-agent".to_string()),
             browser_type: env::var("BROWSER_TYPE").unwrap_or_else(|_| "chromium".to_string()),
-            browser_version: env::var("BROWSER_VERSION")
-                .unwrap_or_else(|_| "unknown".to_string()),
+            browser_version: env::var("BROWSER_VERSION").unwrap_or_else(|_| "unknown".to_string()),
         })
     }
 }
@@ -166,7 +168,39 @@ struct AgentIdentity {
 async fn load_or_register(config: &AgentConfig) -> anyhow::Result<AgentIdentity> {
     let path = config.data_dir.join("identity.json");
     if let Ok(raw) = fs::read_to_string(&path).await {
-        return serde_json::from_str(&raw).context("invalid identity file");
+        if let Ok(existing) = serde_json::from_str::<AgentIdentity>(&raw) {
+            // Re-register with the same IDs so the control plane can upsert the
+            // runtime token and restore in-memory state even after a restart.
+            let client = reqwest::Client::new();
+            match client
+                .post(format!(
+                    "{}/api/v1/agents/register",
+                    config.control_http_url
+                ))
+                .json(&json!({
+                    "registration_token": config.registration_token,
+                    "name": config.agent_name,
+                    "browser_type": config.browser_type,
+                    "browser_version": config.browser_version,
+                    "agent_id": existing.agent_id,
+                    "browser_instance_id": existing.browser_instance_id,
+                }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let refreshed = resp.json::<AgentIdentity>().await?;
+                    info!(agent_id = %refreshed.agent_id, "re-registered with stable identity");
+                    return Ok(refreshed);
+                }
+                Ok(resp) => {
+                    warn!(status = %resp.status(), "re-registration failed, will try fresh registration");
+                }
+                Err(e) => {
+                    warn!(err = %e, "re-registration request failed, will retry as new agent");
+                }
+            }
+        }
     }
     let client = reqwest::Client::new();
     let identity = client
@@ -247,7 +281,10 @@ async fn start_chrome() -> anyhow::Result<Child> {
 
 /// Connects to Chrome CDP, starts Page.startScreencast, and broadcasts
 /// JPEG frames to all connected WS clients.
-async fn screencast_loop(video_tx: broadcast::Sender<Bytes>, last_frame: Arc<Mutex<Option<Bytes>>>) {
+async fn screencast_loop(
+    video_tx: broadcast::Sender<Bytes>,
+    last_frame: Arc<Mutex<Option<Bytes>>>,
+) {
     loop {
         match run_screencast(&video_tx, &last_frame).await {
             Ok(()) => {
@@ -263,7 +300,10 @@ async fn screencast_loop(video_tx: broadcast::Sender<Bytes>, last_frame: Arc<Mut
     }
 }
 
-async fn run_screencast(video_tx: &broadcast::Sender<Bytes>, last_frame: &Arc<Mutex<Option<Bytes>>>) -> anyhow::Result<()> {
+async fn run_screencast(
+    video_tx: &broadcast::Sender<Bytes>,
+    last_frame: &Arc<Mutex<Option<Bytes>>>,
+) -> anyhow::Result<()> {
     let target = ensure_page_target().await?;
     let ws_url = target["webSocketDebuggerUrl"]
         .as_str()
@@ -297,21 +337,22 @@ async fn run_screencast(video_tx: &broadcast::Sender<Bytes>, last_frame: &Arc<Mu
         .await?;
 
     // Start screencast
-    ws_write.send(Message::Text(
-        json!({
-            "id": 1,
-            "method": "Page.startScreencast",
-            "params": {
-                "format": "jpeg",
-                "quality": 80,
-                "maxWidth": 1280,
-                "maxHeight": 720,
-                "everyNthFrame": 1
-            }
-        })
-        .to_string(),
-    ))
-    .await?;
+    ws_write
+        .send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "Page.startScreencast",
+                "params": {
+                    "format": "jpeg",
+                    "quality": 80,
+                    "maxWidth": 1280,
+                    "maxHeight": 720,
+                    "everyNthFrame": 1
+                }
+            })
+            .to_string(),
+        ))
+        .await?;
 
     info!("CDP screencast started");
     let mut sequence: u64 = 0;
@@ -412,10 +453,7 @@ async fn tab_poll_task(tx: mpsc::Sender<Message>, _identity: AgentIdentity) {
 
 // ── Video stream task ────────────────────────────────────────────────────────
 
-async fn video_stream_task(
-    mut video_rx: broadcast::Receiver<Bytes>,
-    tx: mpsc::Sender<Message>,
-) {
+async fn video_stream_task(mut video_rx: broadcast::Receiver<Bytes>, tx: mpsc::Sender<Message>) {
     loop {
         match video_rx.recv().await {
             Ok(data) => {
@@ -516,7 +554,10 @@ fn build_input_cdp_commands(cmd_id: &mut u64, payload: &serde_json::Value) -> Ve
     match event_type {
         "navigate.url" => {
             let url = payload["url"].as_str().unwrap_or("about:blank");
-            cmds.push(json!({"id": *cmd_id, "method": "Page.navigate", "params": {"url": url}}).to_string());
+            cmds.push(
+                json!({"id": *cmd_id, "method": "Page.navigate", "params": {"url": url}})
+                    .to_string(),
+            );
             *cmd_id += 1;
         }
         "navigate.back" => {
@@ -559,15 +600,21 @@ fn build_input_cdp_commands(cmd_id: &mut u64, payload: &serde_json::Value) -> Ve
         }
         "mousemove" => {
             let modifiers = payload["modifiers"].as_i64().unwrap_or(0);
-            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
-                "params": {"type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers}}).to_string());
+            cmds.push(
+                json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers}})
+                .to_string(),
+            );
             *cmd_id += 1;
         }
         "wheel" => {
             let dx = payload["deltaX"].as_f64().unwrap_or(0.0);
             let dy = payload["deltaY"].as_f64().unwrap_or(0.0);
-            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
-                "params": {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy}}).to_string());
+            cmds.push(
+                json!({"id": *cmd_id, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy}})
+                .to_string(),
+            );
             *cmd_id += 1;
         }
         "keydown" | "keyup" => {
@@ -576,19 +623,24 @@ fn build_input_cdp_commands(cmd_id: &mut u64, payload: &serde_json::Value) -> Ve
             let text = payload["text"].as_str().unwrap_or("");
             let modifiers = payload["modifiers"].as_i64().unwrap_or(0);
             let key_code = payload["keyCode"].as_i64().unwrap_or(0);
-            let cdp_type = if event_type == "keydown" { "keyDown" } else { "keyUp" };
-            cmds.push(json!({"id": *cmd_id, "method": "Input.dispatchKeyEvent",
+            let cdp_type = if event_type == "keydown" {
+                "keyDown"
+            } else {
+                "keyUp"
+            };
+            cmds.push(
+                json!({"id": *cmd_id, "method": "Input.dispatchKeyEvent",
                 "params": {"type": cdp_type, "key": key, "code": code, "text": text,
                            "modifiers": modifiers, "windowsVirtualKeyCode": key_code,
-                           "nativeVirtualKeyCode": key_code}}).to_string());
+                           "nativeVirtualKeyCode": key_code}})
+                .to_string(),
+            );
             *cmd_id += 1;
         }
         other => warn!("unknown input event type: {other}"),
     }
     cmds
 }
-
-
 
 async fn cdp_get_targets() -> anyhow::Result<Vec<serde_json::Value>> {
     reqwest::Client::new()
@@ -608,10 +660,9 @@ async fn ensure_page_target() -> anyhow::Result<serde_json::Value> {
     if let Some(tx) = ACTIVE_TAB_TX.get() {
         let active_id = tx.borrow().clone();
         if let Some(id) = &active_id {
-            if let Some(target) = targets
-                .iter()
-                .find(|t| t["id"].as_str() == Some(id.as_str()) && t["type"].as_str() == Some("page"))
-            {
+            if let Some(target) = targets.iter().find(|t| {
+                t["id"].as_str() == Some(id.as_str()) && t["type"].as_str() == Some("page")
+            }) {
                 return Ok(target.clone());
             }
         }
@@ -647,9 +698,7 @@ async fn ensure_page_target() -> anyhow::Result<serde_json::Value> {
 
 fn cdp_to_browser_tabs(targets: &[serde_json::Value]) -> Vec<BrowserTab> {
     // Read the explicitly activated tab ID if one was set
-    let active_tab_id = ACTIVE_TAB_TX
-        .get()
-        .and_then(|tx| tx.borrow().clone());
+    let active_tab_id = ACTIVE_TAB_TX.get().and_then(|tx| tx.borrow().clone());
 
     targets
         .iter()
@@ -672,7 +721,9 @@ fn cdp_to_browser_tabs(targets: &[serde_json::Value]) -> Vec<BrowserTab> {
 }
 
 async fn handle_navigate(payload: &serde_json::Value) -> anyhow::Result<()> {
-    let url = payload["url"].as_str().context("navigate.url: missing url")?;
+    let url = payload["url"]
+        .as_str()
+        .context("navigate.url: missing url")?;
     if let Some(tx) = input_tx() {
         let _ = tx.try_send(json!({"type": "navigate.url", "url": url}));
     }
@@ -712,17 +763,21 @@ async fn handle_tab_command(payload: &serde_json::Value) -> anyhow::Result<()> {
                 .text()
                 .await
                 .unwrap_or_default();
-            info!("json/new response: {:?}", &resp_text[..resp_text.len().min(200)]);
+            info!(
+                "json/new response: {:?}",
+                &resp_text[..resp_text.len().min(200)]
+            );
             if url != "about:blank" {
-                let resp: serde_json::Value = serde_json::from_str(&resp_text)
-                    .unwrap_or(serde_json::Value::Null);
+                let resp: serde_json::Value =
+                    serde_json::from_str(&resp_text).unwrap_or(serde_json::Value::Null);
                 if let Some(ws_url) = resp["webSocketDebuggerUrl"].as_str() {
                     if let Ok((mut tab_ws, _)) = connect_async(ws_url).await {
-                        let _ = tab_ws.send(Message::Text(
-                            json!({"id":1,"method":"Page.navigate","params":{"url":url}})
-                                .to_string(),
-                        ))
-                        .await;
+                        let _ = tab_ws
+                            .send(Message::Text(
+                                json!({"id":1,"method":"Page.navigate","params":{"url":url}})
+                                    .to_string(),
+                            ))
+                            .await;
                         tab_ws.close(None).await.ok();
                     }
                 }
@@ -907,7 +962,10 @@ async fn handle_cdp_tunnel_open(payload: &serde_json::Value) {
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<String>(256);
 
     // Register the tunnel
-    cdp_tunnels().write().await.insert(session_id.clone(), tunnel_tx);
+    cdp_tunnels()
+        .write()
+        .await
+        .insert(session_id.clone(), tunnel_tx);
 
     // Spawn a task to handle bidirectional forwarding
     let sid = session_id.clone();
@@ -1122,10 +1180,7 @@ async fn connect_once(
 fn http_request_with_bearer(url: &str, token: &str) -> anyhow::Result<http::Request<()>> {
     use tokio_tungstenite::tungstenite::handshake::client::generate_key;
     let parsed = url::Url::parse(url).context("invalid websocket url")?;
-    let host = parsed
-        .host_str()
-        .context("url has no host")?
-        .to_string();
+    let host = parsed.host_str().context("url has no host")?.to_string();
     let host_header = match parsed.port() {
         Some(p) => format!("{host}:{p}"),
         None => host,

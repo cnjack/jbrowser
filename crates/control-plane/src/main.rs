@@ -1,3 +1,4 @@
+mod db;
 mod server;
 
 use std::net::SocketAddr;
@@ -21,7 +22,16 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .context("invalid bind address")?;
-    let state = AppState::new(config);
+
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(20)
+        .connect(&config.database_url)
+        .await?;
+
+    db::run_migrations(&pool).await?;
+    info!("database migrations complete");
+
+    let state = AppState::new(config, pool).await;
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 

@@ -2,6 +2,7 @@ export interface Tenant {
   id: string;
   name: string;
   slug: string;
+  role?: string;
 }
 
 export interface BrowserTab {

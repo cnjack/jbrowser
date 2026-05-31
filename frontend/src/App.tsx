@@ -1,10 +1,13 @@
 import React from 'react';
 import { Landing } from './pages/Landing';
 import { Login } from './pages/Login';
+import { Signup } from './pages/Signup';
+import { AcceptInvite } from './pages/AcceptInvite';
 import { BrowserList } from './pages/BrowserList';
 import { BrowserDetail } from './pages/BrowserDetail';
 import { Agents } from './pages/Agents';
 import { ApiKeys } from './pages/ApiKeys';
+import { TenantSettings } from './pages/TenantSettings';
 import {
   DocsOverview,
   DocsQuickstart,
@@ -53,6 +56,16 @@ export function App() {
     return <Login />;
   }
 
+  if (path === '/signup') {
+    return <Signup />;
+  }
+
+  // Invite page (public)
+  const inviteMatch = path.match(/^\/invite\/(.+)$/);
+  if (inviteMatch) {
+    return <AcceptInvite token={decodeURIComponent(inviteMatch[1])} />;
+  }
+
   // Docs pages (works both logged in and out)
   // Public: /docs, /docs/quickstart, /docs/guides/cdp-connect, …
   const publicDocsMatch = path.match(/^\/docs(?:\/(.*))?$/);
@@ -84,6 +97,11 @@ export function App() {
   const apiKeysMatch = path.match(/^\/tenants\/([^/]+)\/settings\/api-keys$/);
   if (apiKeysMatch) {
     return <ApiKeys tenantId={apiKeysMatch[1]} />;
+  }
+
+  const settingsMatch = path.match(/^\/tenants\/([^/]+)\/settings$/);
+  if (settingsMatch) {
+    return <TenantSettings tenantId={settingsMatch[1]} />;
   }
 
   // Authenticated docs: /tenants/:tid/docs, /tenants/:tid/docs/quickstart, …

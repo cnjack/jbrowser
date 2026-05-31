@@ -65,7 +65,7 @@ CREATE TABLE browser_instances (
 CREATE TABLE tokens (
     id CHAR(36) PRIMARY KEY,
     tenant_id CHAR(36) NOT NULL,
-    token_type ENUM('agent_registration', 'tenant_cdp_access') NOT NULL,
+    token_type ENUM('agent_registration', 'tenant_cdp_access', 'agent_runtime') NOT NULL,
     name VARCHAR(255),
     token_hash VARCHAR(255) NOT NULL,
     token_prefix VARCHAR(16),

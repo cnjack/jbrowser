@@ -1,19 +1,78 @@
-import { Globe, LogOut } from 'lucide-react';
+import { Globe, LogOut, Settings, ChevronDown, Plus, UserPlus, Check } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { useMutation } from '@tanstack/react-query';
 import { useAuthStore } from '../stores/auth';
+import { createTenant } from '../api/client';
 
 interface Props {
-  activePage: 'browsers' | 'agents' | 'api-keys' | 'docs';
+  activePage: 'browsers' | 'agents' | 'api-keys' | 'docs' | 'settings';
   tenantId: string;
   browserCount?: number;
 }
 
 export function Sidebar({ activePage, tenantId, browserCount }: Props) {
   const userEmail = useAuthStore((state) => state.userEmail);
+  const tenants = useAuthStore((state) => state.tenants);
+  const currentTenant = useAuthStore((state) => state.getCurrentTenant());
+  const switchTenant = useAuthStore((state) => state.switchTenant);
+  const setTenants = useAuthStore((state) => state.setTenants);
   const logout = useAuthStore((state) => state.logout);
+
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [newTenantName, setNewTenantName] = useState('');
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    function onClickOutside(e: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+        setCreating(false);
+        setNewTenantName('');
+      }
+    }
+    if (dropdownOpen) {
+      document.addEventListener('mousedown', onClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [dropdownOpen]);
+
+  useEffect(() => {
+    if (creating && inputRef.current) {
+      inputRef.current.focus();
+    }
+  }, [creating]);
+
+  const createMutation = useMutation({
+    mutationFn: () => createTenant(newTenantName.trim()),
+    onSuccess: (res) => {
+      setTenants(res.access_token, res.tenants);
+      switchTenant(res.tenant.id);
+      setDropdownOpen(false);
+      setCreating(false);
+      setNewTenantName('');
+      window.location.href = `/tenants/${res.tenant.id}/browsers`;
+    },
+  });
 
   function handleLogout() {
     logout();
     window.location.href = '/login';
+  }
+
+  function handleTenantSwitch(tid: string) {
+    switchTenant(tid);
+    setDropdownOpen(false);
+    window.location.href = `/tenants/${tid}/browsers`;
+  }
+
+  function handleCreateSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (newTenantName.trim()) {
+      createMutation.mutate();
+    }
   }
 
   const initial = userEmail ? userEmail[0].toUpperCase() : 'U';
@@ -30,6 +89,67 @@ export function Sidebar({ activePage, tenantId, browserCount }: Props) {
             <span className="brand-bracket">]</span>
           </span>
         </a>
+      </div>
+
+      {/* Tenant Switcher */}
+      <div className="tenant-switcher" ref={dropdownRef}>
+        <div className="tenant-switcher-label">Workspace</div>
+        <button
+          type="button"
+          className="tenant-switcher-btn"
+          onClick={() => { setDropdownOpen((o) => !o); setCreating(false); }}
+        >
+          <span className="tenant-switcher-name">{currentTenant?.name ?? 'Select workspace'}</span>
+          <ChevronDown size={13} className={`tenant-switcher-chevron${dropdownOpen ? ' open' : ''}`} />
+        </button>
+
+        {dropdownOpen && (
+          <div className="tenant-dropdown">
+            <div className="tenant-dropdown-list">
+              {tenants.map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  className={`tenant-dropdown-item${t.id === tenantId ? ' active' : ''}`}
+                  onClick={() => handleTenantSwitch(t.id)}
+                >
+                  <span className="tenant-dropdown-name">{t.name}</span>
+                  {t.id === tenantId && <Check size={13} className="tenant-dropdown-check" />}
+                </button>
+              ))}
+            </div>
+            <div className="tenant-dropdown-divider" />
+            {creating ? (
+              <form className="tenant-create-form" onSubmit={handleCreateSubmit}>
+                <input
+                  ref={inputRef}
+                  className="tenant-create-input"
+                  type="text"
+                  placeholder="Workspace name…"
+                  value={newTenantName}
+                  onChange={(e) => setNewTenantName(e.target.value)}
+                  disabled={createMutation.isPending}
+                />
+                <button
+                  type="submit"
+                  className="tenant-create-confirm"
+                  disabled={!newTenantName.trim() || createMutation.isPending}
+                >
+                  {createMutation.isPending ? '…' : 'Create'}
+                </button>
+              </form>
+            ) : (
+              <button
+                type="button"
+                className="tenant-dropdown-item tenant-dropdown-create"
+                onClick={() => setCreating(true)}
+              >
+                <Plus size={13} />
+                <span>New workspace</span>
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       <nav className="nav-group">
@@ -62,6 +182,20 @@ export function Sidebar({ activePage, tenantId, browserCount }: Props) {
           <svg viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" /></svg>
           API Keys
         </a>
+        <a
+          href={`/tenants/${tenantId}/settings`}
+          className={`nav-item${activePage === 'settings' ? ' active' : ''}`}
+        >
+          <Settings size={16} />
+          Tenant Settings
+        </a>
+        <a
+          href={`/tenants/${tenantId}/settings#members`}
+          className="nav-item"
+        >
+          <UserPlus size={16} />
+          Invite Members
+        </a>
       </nav>
 
       <nav className="nav-group">
@@ -79,7 +213,7 @@ export function Sidebar({ activePage, tenantId, browserCount }: Props) {
           <div className="user-avatar">{initial}</div>
           <div className="user-meta">
             <strong>{userEmail}</strong>
-            <span>Tenant</span>
+            <span>{currentTenant?.name ?? 'Workspace'}</span>
           </div>
         </div>
         <button type="button" className="logout-btn" onClick={handleLogout} title="Sign out">

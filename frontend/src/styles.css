@@ -2679,3 +2679,396 @@ h1, h2, h3, .btn, .eyebrow {
     grid-template-columns: 1fr;
   }
 }
+
+/* ── Auth Alt Link (login/signup footer) ──────────────────────────────────── */
+
+.auth-alt-link {
+  margin: 16px 0 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.auth-alt-link a {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.auth-alt-link a:hover {
+  color: var(--accent-soft);
+}
+
+/* ── Secondary Button ─────────────────────────────────────────────────────── */
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 12px 18px;
+  font: 600 13px var(--font-display);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: transform var(--motion-fast) var(--ease-std),
+              background var(--motion-fast) var(--ease-std);
+}
+
+.btn-secondary:hover {
+  transform: translateY(-1px);
+  background: var(--surface-warm);
+}
+
+/* ── Danger Button ────────────────────────────────────────────────────────── */
+
+.btn-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--danger);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 12px 18px;
+  font: 600 13px var(--font-display);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: transform var(--motion-fast) var(--ease-std),
+              opacity var(--motion-fast) var(--ease-std);
+}
+
+.btn-danger:hover {
+  transform: translateY(-1px);
+  opacity: 0.9;
+}
+
+.btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* ── Tenant Switcher ──────────────────────────────────────────────────────── */
+
+.tenant-switcher {
+  padding: 14px 18px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  position: relative;
+}
+
+.tenant-switcher-label {
+  color: var(--meta);
+  font: 600 11px/1 var(--font-display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+/* Custom dropdown button */
+.tenant-switcher-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  font: 600 13px var(--font-display);
+  color: var(--fg);
+  cursor: pointer;
+  outline: none;
+  transition: border-color var(--motion-fast) var(--ease-std);
+  gap: 6px;
+}
+
+.tenant-switcher-btn:hover {
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--border));
+}
+
+.tenant-switcher-name {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tenant-switcher-chevron {
+  color: var(--meta);
+  flex-shrink: 0;
+  transition: transform var(--motion-fast) var(--ease-std);
+}
+
+.tenant-switcher-chevron.open {
+  transform: rotate(180deg);
+}
+
+/* Dropdown panel */
+.tenant-dropdown {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  top: calc(100% - 4px);
+  z-index: 200;
+  background: var(--surface-raised, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+  overflow: hidden;
+  animation: dropdown-in var(--motion-fast) var(--ease-std) both;
+}
+
+@keyframes dropdown-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.tenant-dropdown-list {
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.tenant-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--fg);
+  font: 500 13px var(--font-display);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--motion-fast) var(--ease-std);
+}
+
+.tenant-dropdown-item:hover {
+  background: var(--surface-hover, rgba(255,255,255,0.06));
+}
+
+.tenant-dropdown-item.active {
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 10%, transparent);
+}
+
+.tenant-dropdown-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tenant-dropdown-check {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.tenant-dropdown-divider {
+  height: 1px;
+  background: var(--border-soft);
+  margin: 2px 0;
+}
+
+.tenant-dropdown-create {
+  padding: 8px 16px;
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.tenant-dropdown-create:hover {
+  color: var(--fg);
+}
+
+/* Inline create form */
+.tenant-create-form {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+}
+
+.tenant-create-input {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+  padding: 6px 10px;
+  font: 500 12px var(--font-display);
+  color: var(--fg);
+  outline: none;
+}
+
+.tenant-create-input:focus {
+  border-color: color-mix(in oklab, var(--accent) 50%, var(--border));
+}
+
+.tenant-create-confirm {
+  padding: 6px 12px;
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  color: #fff;
+  font: 600 12px var(--font-display);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tenant-create-confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Settings Page ────────────────────────────────────────────────────────── */
+
+.settings-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.settings-section-title {
+  font: 700 18px var(--font-display);
+  letter-spacing: -0.02em;
+  color: var(--fg);
+  margin: 0 0 14px;
+}
+
+.settings-subsection-title {
+  font: 700 15px var(--font-display);
+  letter-spacing: -0.01em;
+  color: var(--fg);
+  margin: 20px 0 10px;
+}
+
+.settings-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 24px;
+}
+
+.settings-card .field input {
+  width: 100%;
+  max-width: 400px;
+}
+
+/* ── Role badge ───────────────────────────────────────────────────────────── */
+
+.role-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  font: 600 11px/1 var(--font-display);
+  text-transform: capitalize;
+}
+
+.role-admin {
+  background: color-mix(in oklab, var(--accent) 12%, var(--surface));
+  color: var(--accent);
+  border: 1px solid color-mix(in oklab, var(--accent) 25%, transparent);
+}
+
+.role-member {
+  background: color-mix(in oklab, var(--muted) 10%, var(--surface));
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+/* ── Role select ──────────────────────────────────────────────────────────── */
+
+.role-select {
+  appearance: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 5px 10px;
+  font: 500 13px var(--font-body);
+  color: var(--fg);
+  cursor: pointer;
+  outline: none;
+}
+
+.role-select:focus {
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--border));
+}
+
+/* ── Invite creator ───────────────────────────────────────────────────────── */
+
+.invite-creator {
+  margin-bottom: 16px;
+}
+
+.invite-creator-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.invite-link-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+}
+
+.invite-link-text {
+  flex: 1;
+  font: 500 12px var(--font-mono);
+  color: var(--fg-2);
+  word-break: break-all;
+}
+
+.invite-cell-link {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ── Danger card ──────────────────────────────────────────────────────────── */
+
+.danger-card {
+  background: color-mix(in oklab, var(--danger) 4%, var(--surface));
+  border-color: color-mix(in oklab, var(--danger) 20%, var(--border));
+}
+
+.danger-card h3 {
+  font: 700 15px var(--font-display);
+  color: var(--danger);
+  margin: 0 0 8px;
+}
+
+.danger-card p {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 16px;
+}
+
+.danger-card .field input {
+  width: 100%;
+  max-width: 400px;
+}
+
+/* ── Invite actions ───────────────────────────────────────────────────────── */
+
+.invite-actions {
+  margin-top: 8px;
+}
+
+.invite-actions .btn-primary,
+.invite-actions .btn-secondary {
+  width: 100%;
+}
