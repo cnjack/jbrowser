@@ -1,4 +1,4 @@
-import { Globe, LogOut, Settings, ChevronDown, Plus, UserPlus, Check } from 'lucide-react';
+import { Globe, LogOut, Settings, ChevronDown, Plus, Check } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { useAuthStore } from '../stores/auth';
@@ -188,13 +188,6 @@ export function Sidebar({ activePage, tenantId, browserCount }: Props) {
         >
           <Settings size={16} />
           Tenant Settings
-        </a>
-        <a
-          href={`/tenants/${tenantId}/settings#members`}
-          className="nav-item"
-        >
-          <UserPlus size={16} />
-          Invite Members
         </a>
       </nav>
 
