@@ -50,6 +50,15 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::browsers::reset_browser),
         )
         .route(
+            "/api/v1/tenants/:tenant_id/browser-instances/:browser_id/config",
+            get(handlers::browsers::get_browser_config)
+                .patch(handlers::browsers::patch_browser_config),
+        )
+        .route(
+            "/api/v1/user-agents",
+            get(handlers::browsers::list_user_agents),
+        )
+        .route(
             "/api/v1/tenants/:tenant_id/agents",
             get(handlers::agents::list_agents),
         )

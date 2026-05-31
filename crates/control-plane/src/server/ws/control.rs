@@ -224,8 +224,8 @@ async fn handle_control_text(
                 .await;
             }
         }
-        "input.event" | "tab.command" | "navigate.url" | "navigate.back"
-        | "navigate.forward" | "navigate.reload" => {
+        "input.event" | "tab.command" | "navigate.url" | "navigate.back" | "navigate.forward"
+        | "navigate.reload" => {
             let browser_id = message
                 .payload
                 .get("browserInstanceId")

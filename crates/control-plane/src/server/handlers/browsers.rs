@@ -3,11 +3,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Instant;
 use uuid::Uuid;
 
-use jbrowser_shared::models::BrowserStatus;
+use jbrowser_shared::models::{BrowserStatus, StealthLevel};
 
 use crate::db::repo;
 use crate::server::auth::middleware::authorize;
@@ -139,4 +140,177 @@ pub async fn delete_browser(
     } else {
         Err(AppError::not_found("browser instance"))
     }
+}
+
+// ── Browser Config Endpoints ───────────────────────────────────────────────
+
+pub async fn get_browser_config(
+    State(state): State<AppState>,
+    Path((tenant_id, browser_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    authorize(&state, &headers, Some(tenant_id)).await?;
+    let browsers = state.browsers.read().await;
+    let browser = browsers
+        .get(&browser_id)
+        .filter(|b| b.tenant_id == tenant_id)
+        .ok_or_else(|| AppError::not_found("browser instance"))?;
+    Ok(Json(json!({ "data": browser.config })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchBrowserConfigRequest {
+    pub fingerprint: Option<PatchFingerprintConfig>,
+    pub stealth: Option<StealthLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchFingerprintConfig {
+    pub user_agent: Option<String>,
+    pub viewport_width: Option<u32>,
+    pub viewport_height: Option<u32>,
+    pub device_scale_factor: Option<f64>,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+}
+
+pub async fn patch_browser_config(
+    State(state): State<AppState>,
+    Path((tenant_id, browser_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(req): Json<PatchBrowserConfigRequest>,
+) -> Result<Json<Value>, AppError> {
+    let claims = authorize(&state, &headers, Some(tenant_id)).await?;
+
+    // Build the merged config
+    let new_config = {
+        let browsers = state.browsers.read().await;
+        let browser = browsers
+            .get(&browser_id)
+            .filter(|b| b.tenant_id == tenant_id)
+            .ok_or_else(|| AppError::not_found("browser instance"))?;
+
+        let mut cfg = browser.config.clone();
+        if let Some(fp) = &req.fingerprint {
+            if fp.user_agent.is_some() {
+                cfg.fingerprint.user_agent = fp.user_agent.clone();
+            }
+            if let Some(w) = fp.viewport_width {
+                cfg.fingerprint.viewport_width = w;
+            }
+            if let Some(h) = fp.viewport_height {
+                cfg.fingerprint.viewport_height = h;
+            }
+            if let Some(s) = fp.device_scale_factor {
+                cfg.fingerprint.device_scale_factor = s;
+            }
+            if fp.timezone.is_some() {
+                cfg.fingerprint.timezone = fp.timezone.clone();
+            }
+            if fp.locale.is_some() {
+                cfg.fingerprint.locale = fp.locale.clone();
+            }
+        }
+        if let Some(stealth) = &req.stealth {
+            cfg.stealth = stealth.clone();
+        }
+        cfg
+    };
+
+    // Persist to DB
+    let stealth_str = match &new_config.stealth {
+        StealthLevel::None => "none",
+        StealthLevel::Basic => "basic",
+    };
+    repo::update_browser_config(
+        &state.pool,
+        &repo::UpdateBrowserConfig {
+            tenant_id,
+            browser_id,
+            user_agent: new_config.fingerprint.user_agent.as_deref(),
+            viewport_width: new_config.fingerprint.viewport_width,
+            viewport_height: new_config.fingerprint.viewport_height,
+            device_scale_factor: new_config.fingerprint.device_scale_factor,
+            timezone: new_config.fingerprint.timezone.as_deref(),
+            locale: new_config.fingerprint.locale.as_deref(),
+            stealth_level: stealth_str,
+        },
+    )
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    // Update in-memory state
+    {
+        let mut browsers = state.browsers.write().await;
+        if let Some(browser) = browsers.get_mut(&browser_id) {
+            browser.viewport_width = new_config.fingerprint.viewport_width;
+            browser.viewport_height = new_config.fingerprint.viewport_height;
+            browser.config = new_config.clone();
+        }
+    }
+
+    // Trigger browser.reset so agent restarts Chrome with new config
+    {
+        let browsers = state.browsers.read().await;
+        if let Some(browser) = browsers.get(&browser_id) {
+            let senders = state.agent_senders.read().await;
+            if let Some(tx) = senders.get(&browser.agent_id) {
+                let cmd = serde_json::to_string(&json!({
+                    "type": "browser.reset",
+                    "payload": {
+                        "browserInstanceId": browser_id,
+                        "config": new_config
+                    }
+                }))
+                .unwrap_or_default();
+                let _ = tx.try_send(cmd);
+            }
+        }
+    }
+
+    // Mark as restarting + record pending reset
+    {
+        let mut browsers = state.browsers.write().await;
+        if let Some(browser) = browsers.get_mut(&browser_id) {
+            browser.status = BrowserStatus::Restarting;
+            browser.tabs = vec![];
+            browser.active_tab_id = None;
+        }
+    }
+    {
+        let mut resets = state.pending_resets.write().await;
+        resets.insert(browser_id, Instant::now());
+    }
+
+    // Audit log
+    let _ = repo::create_audit_log(
+        &state.pool,
+        &repo::CreateAuditLog {
+            id: Uuid::now_v7(),
+            tenant_id,
+            actor_type: "user",
+            actor_id: &claims.sub,
+            action: "browser.config_updated",
+            source: "web_ui",
+            resource_type: None,
+            resource_id: None,
+            browser_instance_id: Some(browser_id),
+            tab_id: None,
+            metadata: None,
+        },
+    )
+    .await;
+
+    Ok(Json(json!({ "data": new_config })))
+}
+
+/// Convenience endpoint: curated list of common User-Agents
+pub async fn list_user_agents() -> Json<Value> {
+    Json(json!({ "data": [
+        { "label": "Chrome 125 / Windows", "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" },
+        { "label": "Chrome 125 / macOS", "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" },
+        { "label": "Chrome 125 / Linux", "value": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" },
+        { "label": "Safari 17 / macOS", "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" },
+        { "label": "Firefox 126 / Windows", "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0" },
+    ] }))
 }

@@ -13,6 +13,22 @@ export interface BrowserTab {
   favicon_url?: string;
 }
 
+export type StealthLevel = 'none' | 'basic';
+
+export interface FingerprintConfig {
+  user_agent?: string | null;
+  viewport_width: number;
+  viewport_height: number;
+  device_scale_factor: number;
+  timezone?: string | null;
+  locale?: string | null;
+}
+
+export interface BrowserConfig {
+  fingerprint: FingerprintConfig;
+  stealth: StealthLevel;
+}
+
 export interface BrowserInstance {
   id: string;
   tenant_id: string;
@@ -30,6 +46,7 @@ export interface BrowserInstance {
   agent_name: string;
   agent_status: 'online' | 'offline' | 'unhealthy';
   last_heartbeat_at?: string | null;
+  config: BrowserConfig;
 }
 
 export interface Agent {

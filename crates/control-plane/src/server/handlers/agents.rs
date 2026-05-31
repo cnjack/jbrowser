@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use jbrowser_shared::{
     constants::{DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH},
-    models::{AgentStatus, AgentSummary, BrowserInstance, BrowserStatus},
+    models::{AgentStatus, AgentSummary, BrowserConfig, BrowserInstance, BrowserStatus},
 };
 
 use crate::db::repo;
@@ -162,6 +162,7 @@ pub async fn agent_register(
                     agent_name: agent_name.clone(),
                     agent_status: AgentStatus::Offline,
                     last_heartbeat_at: None,
+                    config: BrowserConfig::default(),
                 };
                 state.agents.write().await.insert(existing_agent_id, agent);
                 state
@@ -212,6 +213,7 @@ pub async fn agent_register(
         agent_name: agent_name.clone(),
         agent_status: AgentStatus::Offline,
         last_heartbeat_at: None,
+        config: BrowserConfig::default(),
     };
 
     let _ = repo::create_agent(

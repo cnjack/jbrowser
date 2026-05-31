@@ -1,15 +1,32 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use jbrowser_shared::models::BrowserTab;
+use jbrowser_shared::models::{BrowserConfig, BrowserTab, StealthLevel};
 use tokio::process::{Child, Command};
 use tracing::info;
 
 use crate::globals::ACTIVE_TAB_TX;
 
-pub(crate) async fn start_chrome() -> anyhow::Result<Child> {
+pub(crate) async fn start_chrome(config: &BrowserConfig) -> anyhow::Result<Child> {
     info!("Starting Chrome headless …");
-    let chrome = Command::new("chromium")
+
+    let window_size = format!(
+        "--window-size={},{}",
+        config.fingerprint.viewport_width, config.fingerprint.viewport_height
+    );
+    let scale = format!(
+        "--force-device-scale-factor={}",
+        config.fingerprint.device_scale_factor
+    );
+
+    let mut cmd = Command::new("chromium");
+
+    // Set timezone via environment variable
+    if let Some(tz) = &config.fingerprint.timezone {
+        cmd.env("TZ", tz);
+    }
+
+    let chrome = cmd
         .args([
             "--headless=new",
             "--no-sandbox",
@@ -17,8 +34,8 @@ pub(crate) async fn start_chrome() -> anyhow::Result<Child> {
             "--remote-debugging-port=9222",
             "--remote-debugging-address=0.0.0.0",
             "--disable-gpu",
-            "--window-size=1280,720",
-            "--force-device-scale-factor=1",
+            &window_size,
+            &scale,
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-extensions",
@@ -127,3 +144,106 @@ pub(crate) fn cdp_to_browser_tabs(targets: &[serde_json::Value]) -> Vec<BrowserT
         })
         .collect()
 }
+
+/// Build CDP commands to apply fingerprint emulation on a CDP session.
+pub(crate) fn build_fingerprint_cdp_commands(config: &BrowserConfig, start_id: u64) -> Vec<String> {
+    let mut cmds = Vec::new();
+    let mut id = start_id;
+    let fp = &config.fingerprint;
+
+    // User-Agent override
+    if let Some(ua) = &fp.user_agent {
+        cmds.push(
+            serde_json::json!({
+                "id": id,
+                "method": "Emulation.setUserAgentOverride",
+                "params": { "userAgent": ua }
+            })
+            .to_string(),
+        );
+        id += 1;
+    }
+
+    // Device metrics (viewport + DPR)
+    cmds.push(
+        serde_json::json!({
+            "id": id,
+            "method": "Emulation.setDeviceMetricsOverride",
+            "params": {
+                "width": fp.viewport_width,
+                "height": fp.viewport_height,
+                "deviceScaleFactor": fp.device_scale_factor,
+                "mobile": false
+            }
+        })
+        .to_string(),
+    );
+    id += 1;
+
+    // Timezone override
+    if let Some(tz) = &fp.timezone {
+        cmds.push(
+            serde_json::json!({
+                "id": id,
+                "method": "Emulation.setTimezoneOverride",
+                "params": { "timezoneId": tz }
+            })
+            .to_string(),
+        );
+        id += 1;
+    }
+
+    // Locale override
+    if let Some(locale) = &fp.locale {
+        cmds.push(
+            serde_json::json!({
+                "id": id,
+                "method": "Emulation.setLocaleOverride",
+                "params": { "locale": locale }
+            })
+            .to_string(),
+        );
+        id += 1;
+    }
+
+    // Stealth scripts
+    if config.stealth == StealthLevel::Basic {
+        cmds.push(
+            serde_json::json!({
+                "id": id,
+                "method": "Page.addScriptToEvaluateOnNewDocument",
+                "params": { "source": STEALTH_BASIC_SCRIPT }
+            })
+            .to_string(),
+        );
+    }
+
+    cmds
+}
+
+/// Basic stealth: hide obvious automation fingerprints
+const STEALTH_BASIC_SCRIPT: &str = r#"
+// 1. Remove navigator.webdriver
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// 2. Fix Chrome detection point
+window.chrome = { runtime: {} };
+
+// 3. Fix permissions query
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+
+// 4. Fix plugins (headless defaults to empty)
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5],
+});
+
+// 5. Fix languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+"#;

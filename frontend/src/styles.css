@@ -2986,7 +2986,7 @@ h1, h2, h3, .btn, .eyebrow {
 .settings-sections {
   display: flex;
   flex-direction: column;
-  gap: 32px;
+  gap: 36px;
 }
 
 .settings-section-title {
@@ -2996,11 +2996,22 @@ h1, h2, h3, .btn, .eyebrow {
   margin: 0 0 14px;
 }
 
+.settings-section--compact {
+  margin-top: -8px;
+}
+
+.settings-section--compact .settings-card {
+  padding: 20px 24px;
+}
+
 .settings-subsection-title {
-  font: 700 15px var(--font-display);
-  letter-spacing: -0.01em;
-  color: var(--fg);
-  margin: 20px 0 10px;
+  font: 600 13px var(--font-display);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 24px 0 10px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-soft);
 }
 
 .settings-card {
@@ -3008,12 +3019,53 @@ h1, h2, h3, .btn, .eyebrow {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
-  padding: 24px;
+  padding: 28px;
 }
 
 .settings-card .field input {
   width: 100%;
   max-width: 400px;
+}
+
+.settings-card .btn-row {
+  margin-top: 16px;
+}
+
+/* Ghost / outline variant for secondary actions */
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: transparent;
+  color: var(--accent);
+  border: 1.5px solid var(--accent);
+  border-radius: var(--radius-pill);
+  padding: 10px 16px;
+  font: 600 13px var(--font-display);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: transform var(--motion-fast) var(--ease-std),
+              background var(--motion-fast) var(--ease-std);
+}
+
+.btn-ghost:hover {
+  transform: translateY(-1px);
+  background: color-mix(in oklab, var(--accent) 8%, transparent);
+}
+
+.btn-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Empty state for tables */
+.table-empty-state {
+  text-align: center;
+  padding: 32px 16px;
+  color: var(--meta);
+  font-size: 13px;
 }
 
 /* ── Role badge ───────────────────────────────────────────────────────────── */
@@ -3102,18 +3154,22 @@ h1, h2, h3, .btn, .eyebrow {
 .danger-card h3 {
   font: 700 15px var(--font-display);
   color: var(--danger);
-  margin: 0 0 8px;
+  margin: 0 0 6px;
 }
 
 .danger-card p {
   color: var(--muted);
   font-size: 13px;
-  margin: 0 0 16px;
+  margin: 0 0 14px;
 }
 
 .danger-card .field input {
   width: 100%;
   max-width: 400px;
+}
+
+.danger-card .btn-row {
+  margin-top: 16px;
 }
 
 /* ── Invite actions ───────────────────────────────────────────────────────── */
@@ -3125,4 +3181,132 @@ h1, h2, h3, .btn, .eyebrow {
 .invite-actions .btn-primary,
 .invite-actions .btn-secondary {
   width: 100%;
+}
+
+/* ── Browser Config Panel ─────────────────────────────────────────────── */
+
+.config-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.config-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem;
+  width: 480px;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.config-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.config-panel-header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--text);
+}
+
+.config-section {
+  margin-bottom: 0.75rem;
+}
+
+.config-label {
+  display: block;
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.3rem;
+}
+
+.config-select,
+.config-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  color: var(--text);
+  font-size: 0.8rem;
+  margin-bottom: 0.25rem;
+}
+
+.config-input-sm {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
+.config-row-group {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.viewport-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.preset-btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.5rem;
+  color: var(--text);
+  font-size: 0.7rem;
+  cursor: pointer;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.preset-btn:hover {
+  border-color: var(--accent);
+}
+
+.preset-btn.active {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb, 99, 102, 241), 0.15);
+}
+
+.stealth-radios {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.8rem;
+  color: var(--text);
+}
+
+.stealth-radios label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+}
+
+.config-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
 }

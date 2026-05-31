@@ -12,8 +12,8 @@ use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-use crate::chrome::ensure_page_target;
-use crate::globals::active_tab_rx;
+use crate::chrome::{build_fingerprint_cdp_commands, ensure_page_target};
+use crate::globals::{active_tab_rx, browser_config};
 
 pub(crate) async fn screencast_loop(
     video_tx: broadcast::Sender<Bytes>,
@@ -48,21 +48,15 @@ async fn run_screencast(
 
     let (mut ws_write, mut ws_read) = cdp_ws.split();
 
-    ws_write
-        .send(Message::Text(
-            json!({
-                "id": 0,
-                "method": "Emulation.setDeviceMetricsOverride",
-                "params": {
-                    "width": 1280,
-                    "height": 720,
-                    "deviceScaleFactor": 1,
-                    "mobile": false
-                }
-            })
-            .to_string(),
-        ))
-        .await?;
+    // Apply fingerprint + stealth config via CDP
+    let config = browser_config().read().await.clone();
+    let fingerprint_cmds = build_fingerprint_cdp_commands(&config, 0);
+    for cmd in &fingerprint_cmds {
+        ws_write.send(Message::Text(cmd.clone())).await?;
+    }
+
+    let vw = config.fingerprint.viewport_width;
+    let vh = config.fingerprint.viewport_height;
 
     ws_write
         .send(Message::Text(
@@ -72,8 +66,8 @@ async fn run_screencast(
                 "params": {
                     "format": "jpeg",
                     "quality": 80,
-                    "maxWidth": 1280,
-                    "maxHeight": 720,
+                    "maxWidth": vw,
+                    "maxHeight": vh,
                     "everyNthFrame": 1
                 }
             })

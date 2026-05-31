@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Copy, Monitor, Server, Terminal } from 'lucide-react';
-import { getBrowser, resetBrowser } from '../api/browser';
+import { Copy, Monitor, Server, Settings, Terminal } from 'lucide-react';
+import { getBrowser, resetBrowser, updateBrowserConfig, listUserAgents } from '../api/browser';
+import type { BrowserConfig, StealthLevel } from '../api/types';
 import { InputOverlay } from '../components/InputOverlay';
 import { Sidebar } from '../components/Sidebar';
 import { TabBar } from '../components/TabBar';
 import { useAuthStore } from '../stores/auth';
 import { ControlSocket } from '../ws/control';
+
+const VIEWPORT_PRESETS = [
+  { label: 'Desktop HD', width: 1920, height: 1080, scale: 1 },
+  { label: 'Desktop', width: 1280, height: 720, scale: 1 },
+  { label: 'iPad', width: 1024, height: 768, scale: 2 },
+  { label: 'iPhone 15', width: 393, height: 852, scale: 3 },
+  { label: 'Pixel 7', width: 412, height: 915, scale: 2.625 },
+];
 
 interface Props {
   tenantId: string;
@@ -24,10 +33,12 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
   const [statusUrl, setStatusUrl] = useState('');
   const [copied, setCopied] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
+  const [configOpen, setConfigOpen] = useState(false);
   const socket = useMemo(() => new ControlSocket(), []);
   const loadingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastFrameTimeRef = useRef<number>(Date.now());
-  const frameWatchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Config editing state
+  const [editConfig, setEditConfig] = useState<BrowserConfig | null>(null);
 
   const browserQuery = useQuery({
     queryKey: ['browser', tenantId, browserId],
@@ -41,6 +52,20 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
     },
     onError: (error: Error) => {
       console.error('Reset failed:', error.message);
+    },
+  });
+
+  const userAgentsQuery = useQuery({
+    queryKey: ['user-agents'],
+    queryFn: listUserAgents,
+    staleTime: Infinity,
+  });
+
+  const configMutation = useMutation({
+    mutationFn: (config: Partial<BrowserConfig>) => updateBrowserConfig(tenantId, browserId, config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] });
+      setConfigOpen(false);
     },
   });
 
@@ -74,24 +99,18 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
           setPreviewSegment(event.payload);
           setPreviewEnded(false);
           setLoading(false);
-          lastFrameTimeRef.current = Date.now();
           if (loadingTimerRef.current) clearTimeout(loadingTimerRef.current);
         }
       },
       () => setConnected(true),
-      () => setConnected(false),
+      () => {
+        setConnected(false);
+        setPreviewEnded(true);
+      },
     );
     socket.subscribe(browserId);
-    // Frame watchdog: detect stale stream as safety net
-    lastFrameTimeRef.current = Date.now();
-    frameWatchdogRef.current = setInterval(() => {
-      if (Date.now() - lastFrameTimeRef.current > 3000) {
-        setPreviewEnded(true);
-      }
-    }, 1000);
     return () => {
       socket.close();
-      if (frameWatchdogRef.current) clearInterval(frameWatchdogRef.current);
     };
   }, [browserId, queryClient, socket, tenantId, token]);
 
@@ -293,9 +312,146 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
               </div>
               <p className="info-hint">Use a CDP API key in the <code>Authorization</code> header.</p>
             </div>
+
+            <div className="info-section">
+              <div className="info-label"><Settings size={13} /> Configuration</div>
+              <div className="info-row">
+                <span className="info-key">Stealth</span>
+                <span className="info-value">{browser.config?.stealth ?? 'none'}</span>
+              </div>
+              <div className="info-row">
+                <span className="info-key">UA</span>
+                <span className="info-value" style={{ fontSize: '0.7rem' }}>{browser.config?.fingerprint?.user_agent ?? 'Default'}</span>
+              </div>
+              <button
+                className="btn-secondary"
+                style={{ marginTop: '0.5rem', width: '100%', fontSize: '0.75rem', padding: '0.35rem' }}
+                onClick={() => {
+                  setEditConfig(browser.config ?? {
+                    fingerprint: { viewport_width: 1280, viewport_height: 720, device_scale_factor: 1 },
+                    stealth: 'none',
+                  });
+                  setConfigOpen(true);
+                }}
+              >
+                Edit Configuration
+              </button>
+            </div>
           </aside>
         )}
       </div>
+
+      {/* Config editing modal */}
+      {configOpen && editConfig && (
+        <div className="config-overlay" onClick={() => setConfigOpen(false)}>
+          <div className="config-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="config-panel-header">
+              <h3>Browser Configuration</h3>
+              <button className="icon-btn-sm" onClick={() => setConfigOpen(false)}>×</button>
+            </div>
+
+            <div className="config-section">
+              <label className="config-label">User-Agent</label>
+              <select
+                className="config-select"
+                value={editConfig.fingerprint.user_agent ?? ''}
+                onChange={(e) => setEditConfig({
+                  ...editConfig,
+                  fingerprint: { ...editConfig.fingerprint, user_agent: e.target.value || null },
+                })}
+              >
+                <option value="">Chrome Default</option>
+                {(userAgentsQuery.data ?? []).map((ua) => (
+                  <option key={ua.value} value={ua.value}>{ua.label}</option>
+                ))}
+              </select>
+              <input
+                type="text"
+                className="config-input"
+                placeholder="Or enter custom UA..."
+                value={editConfig.fingerprint.user_agent ?? ''}
+                onChange={(e) => setEditConfig({
+                  ...editConfig,
+                  fingerprint: { ...editConfig.fingerprint, user_agent: e.target.value || null },
+                })}
+              />
+            </div>
+
+            <div className="config-section">
+              <label className="config-label">Viewport Preset</label>
+              <div className="viewport-presets">
+                {VIEWPORT_PRESETS.map((p) => (
+                  <button
+                    key={p.label}
+                    className={`preset-btn${editConfig.fingerprint.viewport_width === p.width && editConfig.fingerprint.viewport_height === p.height ? ' active' : ''}`}
+                    onClick={() => setEditConfig({
+                      ...editConfig,
+                      fingerprint: { ...editConfig.fingerprint, viewport_width: p.width, viewport_height: p.height, device_scale_factor: p.scale },
+                    })}
+                  >
+                    {p.label}<br /><small>{p.width}×{p.height}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="config-section config-row-group">
+              <div>
+                <label className="config-label">Width</label>
+                <input type="number" className="config-input-sm" value={editConfig.fingerprint.viewport_width}
+                  onChange={(e) => setEditConfig({ ...editConfig, fingerprint: { ...editConfig.fingerprint, viewport_width: Number(e.target.value) || 1280 } })} />
+              </div>
+              <div>
+                <label className="config-label">Height</label>
+                <input type="number" className="config-input-sm" value={editConfig.fingerprint.viewport_height}
+                  onChange={(e) => setEditConfig({ ...editConfig, fingerprint: { ...editConfig.fingerprint, viewport_height: Number(e.target.value) || 720 } })} />
+              </div>
+              <div>
+                <label className="config-label">Scale</label>
+                <input type="number" step="0.1" className="config-input-sm" value={editConfig.fingerprint.device_scale_factor}
+                  onChange={(e) => setEditConfig({ ...editConfig, fingerprint: { ...editConfig.fingerprint, device_scale_factor: Number(e.target.value) || 1 } })} />
+              </div>
+            </div>
+
+            <div className="config-section config-row-group">
+              <div style={{ flex: 1 }}>
+                <label className="config-label">Timezone</label>
+                <input type="text" className="config-input" placeholder="e.g. America/New_York"
+                  value={editConfig.fingerprint.timezone ?? ''}
+                  onChange={(e) => setEditConfig({ ...editConfig, fingerprint: { ...editConfig.fingerprint, timezone: e.target.value || null } })} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="config-label">Locale</label>
+                <input type="text" className="config-input" placeholder="e.g. en-US"
+                  value={editConfig.fingerprint.locale ?? ''}
+                  onChange={(e) => setEditConfig({ ...editConfig, fingerprint: { ...editConfig.fingerprint, locale: e.target.value || null } })} />
+              </div>
+            </div>
+
+            <div className="config-section">
+              <label className="config-label">Stealth Level</label>
+              <div className="stealth-radios">
+                <label><input type="radio" name="stealth" value="none" checked={editConfig.stealth === 'none'}
+                  onChange={() => setEditConfig({ ...editConfig, stealth: 'none' as StealthLevel })} /> None</label>
+                <label><input type="radio" name="stealth" value="basic" checked={editConfig.stealth === 'basic'}
+                  onChange={() => setEditConfig({ ...editConfig, stealth: 'basic' as StealthLevel })} /> Basic</label>
+              </div>
+            </div>
+
+            <div className="config-actions">
+              <button className="btn-secondary" onClick={() => {
+                setEditConfig({
+                  fingerprint: { viewport_width: 1280, viewport_height: 720, device_scale_factor: 1 },
+                  stealth: 'none',
+                });
+              }}>Reset to Default</button>
+              <button className="btn-primary" disabled={configMutation.isPending} onClick={() => configMutation.mutate(editConfig)}>
+                {configMutation.isPending ? 'Applying...' : 'Apply Changes'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Status bar */}
       <div className="browser-status-bar">

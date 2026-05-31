@@ -11,11 +11,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use jbrowser_shared::models::BrowserConfig;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use config::{load_or_register, save_identity, AgentConfig};
-use globals::{ACTIVE_TAB_TX, CDP_TUNNELS, INPUT_TX};
+use globals::{ACTIVE_TAB_TX, BROWSER_CONFIG, CDP_TUNNELS, INPUT_TX};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,7 +33,13 @@ async fn main() -> anyhow::Result<()> {
     let identity = load_or_register(&config).await?;
     save_identity(&config, &identity).await?;
 
-    let _chrome = chrome::start_chrome().await?;
+    // Initialize browser config (default; will be updated from control plane in future)
+    let browser_cfg = BrowserConfig::default();
+    BROWSER_CONFIG
+        .set(Arc::new(RwLock::new(browser_cfg.clone())))
+        .expect("BROWSER_CONFIG already set");
+
+    let _chrome = chrome::start_chrome(&browser_cfg).await?;
 
     let (video_tx, _) = broadcast::channel::<Bytes>(16);
     let last_frame: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));

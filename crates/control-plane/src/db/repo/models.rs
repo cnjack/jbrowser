@@ -69,6 +69,11 @@ pub struct BrowserRow {
     pub tabs_snapshot: Option<String>,
     pub viewport_width: i32,
     pub viewport_height: i32,
+    pub user_agent: Option<String>,
+    pub device_scale_factor: f64,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+    pub stealth_level: String,
 }
 
 #[derive(Debug, Clone)]

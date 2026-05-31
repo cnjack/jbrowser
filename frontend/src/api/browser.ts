@@ -1,5 +1,5 @@
 import { api } from './client';
-import type { Agent, BrowserInstance, LoginResponse, TokenRecord } from './types';
+import type { Agent, BrowserConfig, BrowserInstance, LoginResponse, TokenRecord } from './types';
 
 export function login(email: string, password: string) {
   return api<LoginResponse>('/api/v1/auth/login', {
@@ -22,6 +22,26 @@ export async function resetBrowser(tenantId: string, browserId: string) {
   const response = await api<{ data: BrowserInstance }>(`/api/v1/tenants/${tenantId}/browser-instances/${browserId}/reset`, {
     method: 'POST',
   });
+  return response.data;
+}
+
+// --- Browser Config ---
+
+export async function getBrowserConfig(tenantId: string, browserId: string) {
+  const response = await api<{ data: BrowserConfig }>(`/api/v1/tenants/${tenantId}/browser-instances/${browserId}/config`);
+  return response.data;
+}
+
+export async function updateBrowserConfig(tenantId: string, browserId: string, config: Partial<BrowserConfig>) {
+  const response = await api<{ data: BrowserConfig }>(`/api/v1/tenants/${tenantId}/browser-instances/${browserId}/config`, {
+    method: 'PATCH',
+    body: JSON.stringify(config),
+  });
+  return response.data;
+}
+
+export async function listUserAgents() {
+  const response = await api<{ data: { label: string; value: string }[] }>('/api/v1/user-agents');
   return response.data;
 }
 

@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
-use crate::chrome::ensure_page_target;
-use crate::globals::active_tab_rx;
+use crate::chrome::{build_fingerprint_cdp_commands, ensure_page_target};
+use crate::globals::{active_tab_rx, browser_config};
 
 pub(crate) async fn input_loop(mut rx: mpsc::Receiver<serde_json::Value>) {
     loop {
@@ -36,21 +36,12 @@ async fn run_input_session(rx: &mut mpsc::Receiver<serde_json::Value>) -> anyhow
     let (mut write, mut read) = ws.split();
     info!("input CDP session connected");
 
-    write
-        .send(Message::Text(
-            json!({
-                "id": 999,
-                "method": "Emulation.setDeviceMetricsOverride",
-                "params": {
-                    "width": 1280,
-                    "height": 720,
-                    "deviceScaleFactor": 1,
-                    "mobile": false
-                }
-            })
-            .to_string(),
-        ))
-        .await?;
+    // Apply fingerprint + stealth config via CDP
+    let config = browser_config().read().await.clone();
+    let fingerprint_cmds = build_fingerprint_cdp_commands(&config, 900);
+    for cmd in &fingerprint_cmds {
+        write.send(Message::Text(cmd.clone())).await?;
+    }
 
     let mut cmd_id: u64 = 1000;
     let mut tab_rx = active_tab_rx();

@@ -1,10 +1,11 @@
 use futures_util::SinkExt;
+use jbrowser_shared::models::BrowserConfig;
 use jbrowser_shared::protocol::ControlToAgentMessage;
 use serde_json::json;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
-use crate::globals::{input_tx, set_active_tab};
+use crate::globals::{browser_config, input_tx, set_active_tab};
 
 pub(crate) async fn dispatch_control_message(msg: ControlToAgentMessage) {
     if msg.kind == "input.event" {
@@ -153,6 +154,14 @@ async fn handle_browser_reset(_payload: &serde_json::Value) -> anyhow::Result<()
     use futures_util::StreamExt as _;
     use std::collections::HashSet;
 
+    // If the reset payload includes a config, update the global BROWSER_CONFIG
+    if let Some(cfg_val) = _payload.get("config") {
+        if let Ok(new_cfg) = serde_json::from_value::<BrowserConfig>(cfg_val.clone()) {
+            info!("updating browser config from reset payload");
+            *browser_config().write().await = new_cfg;
+        }
+    }
+
     let client = reqwest::Client::new();
 
     let targets: Vec<serde_json::Value> = client
@@ -214,7 +223,10 @@ async fn handle_browser_reset(_payload: &serde_json::Value) -> anyhow::Result<()
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                             if let Some(id) = v["id"].as_u64() {
                                 received.insert(id);
-                                if received.contains(&1) && received.contains(&2) && received.contains(&3) {
+                                if received.contains(&1)
+                                    && received.contains(&2)
+                                    && received.contains(&3)
+                                {
                                     break;
                                 }
                             }

@@ -128,9 +128,11 @@ function GeneralSection({
             />
           </div>
           {isAdmin && (
-            <button type="submit" className="btn-primary" disabled={mutation.isPending}>
-              {mutation.isPending ? 'Saving…' : saved ? 'Saved!' : 'Save changes'}
-            </button>
+            <div className="btn-row">
+              <button type="submit" className="btn-primary" disabled={mutation.isPending}>
+                {mutation.isPending ? 'Saving…' : saved ? 'Saved!' : 'Save changes'}
+              </button>
+            </div>
           )}
           {mutation.isError && (
             <div className="error-msg" style={{ marginTop: 12 }}>
@@ -189,6 +191,8 @@ function MembersSection({
       <div className="settings-card">
         {membersLoading ? (
           <div className="loading-state">Loading members…</div>
+        ) : members.length === 0 ? (
+          <div className="table-empty-state">No members yet</div>
         ) : (
           <div className="table-wrap" style={{ marginTop: 0 }}>
             <table className="data-table">
@@ -311,7 +315,7 @@ function InviteCreator({
         </select>
         <button
           type="button"
-          className="btn-primary"
+          className="btn-ghost"
           onClick={() => mutation.mutate()}
           disabled={mutation.isPending}
         >
@@ -402,7 +406,7 @@ function DangerSection({ tenantId, tenantName }: { tenantId: string; tenantName:
   });
 
   return (
-    <section className="settings-section">
+    <section className="settings-section settings-section--compact">
       <h2 className="settings-section-title">Danger Zone</h2>
       <div className="settings-card danger-card">
         <h3>Delete this tenant</h3>
@@ -422,14 +426,16 @@ function DangerSection({ tenantId, tenantName }: { tenantId: string; tenantName:
             placeholder={tenantName}
           />
         </div>
-        <button
-          type="button"
-          className="btn-danger"
-          disabled={confirmName !== tenantName || mutation.isPending}
-          onClick={() => mutation.mutate()}
-        >
-          {mutation.isPending ? 'Deleting…' : 'Delete Tenant'}
-        </button>
+        <div className="btn-row">
+          <button
+            type="button"
+            className="btn-danger"
+            disabled={confirmName !== tenantName || mutation.isPending}
+            onClick={() => mutation.mutate()}
+          >
+            {mutation.isPending ? 'Deleting…' : 'Delete Tenant'}
+          </button>
+        </div>
         {mutation.isError && (
           <div className="error-msg" style={{ marginTop: 12 }}>
             {mutation.error instanceof Error ? mutation.error.message : 'Failed to delete tenant'}

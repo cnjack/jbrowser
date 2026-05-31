@@ -1,7 +1,15 @@
 use std::{collections::HashMap, sync::OnceLock};
 
+use jbrowser_shared::models::BrowserConfig;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
+
+// ── Global browser config ──────────────────────────────────────────────────
+pub(crate) static BROWSER_CONFIG: OnceLock<Arc<RwLock<BrowserConfig>>> = OnceLock::new();
+
+pub(crate) fn browser_config() -> &'static Arc<RwLock<BrowserConfig>> {
+    BROWSER_CONFIG.get().expect("BROWSER_CONFIG not set")
+}
 
 // ── Global persistent input channel ────────────────────────────────────────
 pub(crate) static INPUT_TX: OnceLock<mpsc::Sender<serde_json::Value>> = OnceLock::new();

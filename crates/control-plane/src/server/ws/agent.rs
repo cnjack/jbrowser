@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use jbrowser_shared::{
     constants::{DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH},
-    models::{AgentStatus, AgentSummary, BrowserInstance, BrowserStatus, BrowserTab},
+    models::{
+        AgentStatus, AgentSummary, BrowserConfig, BrowserInstance, BrowserStatus, BrowserTab,
+    },
     protocol::decode_video_frame,
 };
 
@@ -121,6 +123,7 @@ async fn handle_agent_socket(
                         agent_name,
                         agent_status: AgentStatus::Offline,
                         last_heartbeat_at: None,
+                        config: BrowserConfig::default(),
                     };
                     state.agents.write().await.insert(hint_id, agent);
                     state.browsers.write().await.insert(bid, browser);
@@ -248,7 +251,8 @@ async fn handle_agent_text(state: &AppState, agent_id: Uuid, browser_id: Uuid, v
                     browser.agent_status = AgentStatus::Online;
                     browser.last_heartbeat_at = Some(now);
                     if let Some(tabs) = value.pointer("/payload/tabs") {
-                        if let Ok(parsed) = serde_json::from_value::<Vec<BrowserTab>>(tabs.clone()) {
+                        if let Ok(parsed) = serde_json::from_value::<Vec<BrowserTab>>(tabs.clone())
+                        {
                             browser.active_tab_id =
                                 parsed.iter().find(|t| t.active).map(|t| t.id.clone());
                             browser.tabs = parsed;
@@ -260,8 +264,10 @@ async fn handle_agent_text(state: &AppState, agent_id: Uuid, browser_id: Uuid, v
             let ev_map = state.browser_events.read().await;
             if let Some(tx) = ev_map.get(&browser_id) {
                 let _ = tx.send(
-                    serde_json::to_string(&serde_json::json!({"type":"reset.completed","payload":{}}))
-                        .unwrap_or_default(),
+                    serde_json::to_string(
+                        &serde_json::json!({"type":"reset.completed","payload":{}}),
+                    )
+                    .unwrap_or_default(),
                 );
             }
             info!(%browser_id, "reset.completed received");
@@ -283,8 +289,10 @@ async fn handle_agent_text(state: &AppState, agent_id: Uuid, browser_id: Uuid, v
             let ev_map = state.browser_events.read().await;
             if let Some(tx) = ev_map.get(&browser_id) {
                 let _ = tx.send(
-                    serde_json::to_string(&serde_json::json!({"type":"reset.failed","payload":{"error":error}}))
-                        .unwrap_or_default(),
+                    serde_json::to_string(
+                        &serde_json::json!({"type":"reset.failed","payload":{"error":error}}),
+                    )
+                    .unwrap_or_default(),
                 );
             }
             info!(%browser_id, %error, "reset.failed received");
@@ -300,8 +308,7 @@ async fn handle_agent_text(state: &AppState, agent_id: Uuid, browser_id: Uuid, v
                 browser.agent_status = AgentStatus::Online;
                 browser.last_heartbeat_at = Some(now);
                 if msg_type == "tab.list" {
-                    if let Some(tabs) =
-                        value.get("payload").and_then(|payload| payload.get("tabs"))
+                    if let Some(tabs) = value.get("payload").and_then(|payload| payload.get("tabs"))
                     {
                         if !is_resetting {
                             if let Ok(parsed) =

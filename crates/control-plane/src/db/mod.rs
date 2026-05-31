@@ -4,13 +4,9 @@ pub mod repo;
 use sqlx::MySqlPool;
 use tracing::info;
 
-const MIGRATIONS: &[(&str, &str)] = &[
-    ("0001_init", include_str!("migrations/0001_init.sql")),
-    (
-        "0002_invitations",
-        include_str!("migrations/0002_invitations.sql"),
-    ),
-];
+// Auto-generated at build time from src/db/migrations/*.sql (sorted by name).
+// Adding a new .sql file is sufficient — no manual registration needed.
+include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
 pub async fn run_migrations(pool: &MySqlPool) -> anyhow::Result<()> {
     // Create tracking table
