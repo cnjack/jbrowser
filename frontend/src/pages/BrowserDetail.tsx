@@ -20,11 +20,14 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
   const [previewSegment, setPreviewSegment] = useState<ArrayBuffer | null>(null);
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [previewEnded, setPreviewEnded] = useState(false);
   const [statusUrl, setStatusUrl] = useState('');
   const [copied, setCopied] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
   const socket = useMemo(() => new ControlSocket(), []);
   const loadingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastFrameTimeRef = useRef<number>(Date.now());
+  const frameWatchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const browserQuery = useQuery({
     queryKey: ['browser', tenantId, browserId],
@@ -63,9 +66,15 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
           queryClient.invalidateQueries({ queryKey: ['browser', tenantId, browserId] });
           console.error('Browser reset failed:', (event.payload as { error: string }).error);
         }
+        if (event.type === 'preview.ended') {
+          setPreviewEnded(true);
+          return;
+        }
         if (event.type === 'preview.segment') {
           setPreviewSegment(event.payload);
+          setPreviewEnded(false);
           setLoading(false);
+          lastFrameTimeRef.current = Date.now();
           if (loadingTimerRef.current) clearTimeout(loadingTimerRef.current);
         }
       },
@@ -73,8 +82,16 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
       () => setConnected(false),
     );
     socket.subscribe(browserId);
+    // Frame watchdog: detect stale stream as safety net
+    lastFrameTimeRef.current = Date.now();
+    frameWatchdogRef.current = setInterval(() => {
+      if (Date.now() - lastFrameTimeRef.current > 3000) {
+        setPreviewEnded(true);
+      }
+    }, 1000);
     return () => {
       socket.close();
+      if (frameWatchdogRef.current) clearInterval(frameWatchdogRef.current);
     };
   }, [browserId, queryClient, socket, tenantId, token]);
 
@@ -207,6 +224,7 @@ export function BrowserDetail({ tenantId, browserId }: Props) {
             browserStatus={browser.status}
             onInput={(payload) => socket.send({ type: 'input.event', payload: { browserInstanceId: browser.id, ...payload } })}
             previewSegment={previewSegment}
+            previewEnded={previewEnded}
           />
           {browser.status === 'restarting' && (
             <div className="reset-overlay">

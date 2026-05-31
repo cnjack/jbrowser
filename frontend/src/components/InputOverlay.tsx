@@ -16,6 +16,7 @@ interface Props {
   browserStatus?: string;
   onInput: (payload: InputPayload) => void;
   previewSegment?: ArrayBuffer | null;
+  previewEnded?: boolean;
 }
 
 // Header layout: 1 byte type | 4 bytes stream_id | 8 bytes sequence | 8 bytes timestamp_ms = 21 bytes
@@ -44,7 +45,7 @@ const PREVENT_DEFAULT_KEYS = new Set([
   'Backspace', ' ', 'F1', 'F3', 'F5', 'F6',
 ]);
 
-export function InputOverlay({ browser, browserStatus, onInput, previewSegment }: Props) {
+export function InputOverlay({ browser, browserStatus, onInput, previewSegment, previewEnded }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const imgPoolRef = useRef<HTMLImageElement[]>([]);
@@ -263,10 +264,15 @@ export function InputOverlay({ browser, browserStatus, onInput, previewSegment }
           style={{ left: r.x, top: r.y }}
         />
       ))}
-      {!previewSegment && (
+      {!previewSegment && !previewEnded && (
         <div className="preview-overlay-hint">
           <strong>Waiting for stream…</strong>
           <span>Agent is starting Chrome screencast.</span>
+        </div>
+      )}
+      {previewEnded && (
+        <div className="preview-ended-overlay">
+          <span>Browser disconnected</span>
         </div>
       )}
     </div>

@@ -138,7 +138,7 @@ async fn handle_agent_socket(
         }
     };
 
-    let (bcast_tx, _) = broadcast::channel::<Vec<u8>>(128);
+    let (bcast_tx, _) = broadcast::channel::<Vec<u8>>(16);
     state
         .browser_preview
         .write()
@@ -189,7 +189,6 @@ async fn handle_agent_socket(
                         if let Ok(_frame) = decode_video_frame(bytes.clone().into()) {
                             let subs = bcast_tx.receiver_count();
                             let _ = bcast_tx.send(bytes.clone());
-                            let _ = state.preview_tx.send(bytes.clone());
                             state.browser_last_frame.write().await.insert(browser_id, bytes);
                             tracing::debug!(seq = _frame.sequence, subs, "video frame relayed");
                         }

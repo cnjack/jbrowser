@@ -1179,6 +1179,19 @@ h1, h2, h3, .btn, .eyebrow {
   margin-top: 0.4rem;
 }
 
+.preview-ended-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 20;
+  color: #fff;
+  font-size: 0.95rem;
+  pointer-events: none;
+}
+
 .browser-status-bar {
   background: var(--surface-warm);
   border-top: 1px solid var(--border);

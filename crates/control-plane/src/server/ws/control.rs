@@ -19,6 +19,33 @@ use crate::server::auth::crypto::decode_jwt;
 use crate::server::state::AppState;
 use crate::server::types::JwtClaims;
 
+// --- Backpressure helper types ---
+
+enum PreviewRecv {
+    Frame(Vec<u8>),
+    Lagged(u64),
+    Closed,
+}
+
+async fn recv_preview(rx: &mut broadcast::Receiver<Vec<u8>>) -> PreviewRecv {
+    match rx.recv().await {
+        Ok(bytes) => PreviewRecv::Frame(bytes),
+        Err(broadcast::error::RecvError::Lagged(n)) => PreviewRecv::Lagged(n),
+        Err(broadcast::error::RecvError::Closed) => PreviewRecv::Closed,
+    }
+}
+
+async fn recv_event(rx: &mut broadcast::Receiver<String>) -> Option<String> {
+    match rx.recv().await {
+        Ok(s) => Some(s),
+        Err(broadcast::error::RecvError::Lagged(n)) => {
+            tracing::warn!(lagged_events = n, "event channel lagged");
+            None
+        }
+        Err(broadcast::error::RecvError::Closed) => None,
+    }
+}
+
 pub async fn ws_control(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_control_socket(state, socket))
         .into_response()
@@ -80,14 +107,14 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
     loop {
         let video_fut = async {
             match preview_rx.as_mut() {
-                Some(rx) => rx.recv().await.ok(),
+                Some(rx) => Some(recv_preview(rx).await),
                 None => std::future::pending().await,
             }
         };
 
         let event_fut = async {
             match events_rx.as_mut() {
-                Some(rx) => rx.recv().await.ok(),
+                Some(rx) => recv_event(rx).await,
                 None => std::future::pending().await,
             }
         };
@@ -124,18 +151,21 @@ async fn handle_control_socket(state: AppState, socket: WebSocket) {
                     return;
                 }
             }
-            Some(bytes) = video_fut => {
-                if sender.send(Message::Binary(bytes)).await.is_err() {
-                    return;
-                }
-                if let Some(bid) = current_browser_id {
-                    if preview_rx.as_mut().map(|rx| rx.is_empty()).unwrap_or(false) {
-                        // still valid
-                    } else {
-                        let map = state.browser_preview.read().await;
-                        if let Some(tx) = map.get(&bid) {
-                            preview_rx = Some(tx.subscribe());
+            Some(result) = video_fut => {
+                match result {
+                    PreviewRecv::Frame(bytes) => {
+                        if sender.send(Message::Binary(bytes)).await.is_err() {
+                            return;
                         }
+                    }
+                    PreviewRecv::Lagged(n) => {
+                        tracing::warn!(browser_id = ?current_browser_id, lagged_frames = n, "viewer lagged");
+                    }
+                    PreviewRecv::Closed => {
+                        let _ = sender.send(Message::Text(
+                            serde_json::json!({"type": "preview.ended"}).to_string()
+                        )).await;
+                        preview_rx = None;
                     }
                 }
             }

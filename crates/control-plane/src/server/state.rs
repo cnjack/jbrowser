@@ -16,7 +16,6 @@ pub struct AppState {
     pub(crate) pool: sqlx::MySqlPool,
     pub(crate) agents: Arc<RwLock<HashMap<Uuid, AgentSummary>>>,
     pub(crate) browsers: Arc<RwLock<HashMap<Uuid, BrowserInstance>>>,
-    pub(crate) preview_tx: broadcast::Sender<Vec<u8>>,
     pub(crate) agent_senders: Arc<RwLock<HashMap<Uuid, mpsc::Sender<String>>>>,
     pub(crate) browser_preview: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Vec<u8>>>>>,
     pub(crate) browser_last_frame: Arc<RwLock<HashMap<Uuid, Vec<u8>>>>,
@@ -28,8 +27,6 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(config: AppConfig, pool: sqlx::MySqlPool) -> Self {
-        let (preview_tx, _) = broadcast::channel(64);
-
         let existing = repo::get_user_by_email(&pool, &config.demo_email)
             .await
             .ok()
@@ -109,7 +106,6 @@ impl AppState {
             pool,
             agents: Arc::new(RwLock::new(HashMap::new())),
             browsers: Arc::new(RwLock::new(HashMap::new())),
-            preview_tx,
             agent_senders: Arc::new(RwLock::new(HashMap::new())),
             browser_preview: Arc::new(RwLock::new(HashMap::new())),
             browser_last_frame: Arc::new(RwLock::new(HashMap::new())),

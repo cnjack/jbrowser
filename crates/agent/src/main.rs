@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     let _chrome = chrome::start_chrome().await?;
 
-    let (video_tx, _) = broadcast::channel::<Bytes>(128);
+    let (video_tx, _) = broadcast::channel::<Bytes>(16);
     let last_frame: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
 
     let (active_tab_tx, _) = watch::channel::<Option<String>>(None);
