@@ -12,11 +12,24 @@ env:
 
 jobs:
   publish:
-    name: Build & Push
+    name: Build & Push — ${{ matrix.name }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: control
+            file: docker/Dockerfile.control
+            image: jbrowser-control
+            scope: control
+          - name: agent-chromium
+            file: docker/Dockerfile.agent-chromium
+            image: jbrowser-agent-chromium
+            scope: agent-chromium
 
     steps:
       - name: Checkout
@@ -35,52 +48,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Control Plane ──────────────────────────────────────────────────────
-
-      - name: Docker metadata — control
-        id: meta-control
+      - name: Docker metadata
+        id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/jbrowser-control
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build & Push — control
+      - name: Build & Push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile.control
+          file: ${{ matrix.file }}
           push: true
-          tags: ${{ steps.meta-control.outputs.tags }}
-          labels: ${{ steps.meta-control.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha,scope=control
-          cache-to: type=gha,scope=control,mode=max
-
-      # ── Agent (Chromium) ───────────────────────────────────────────────────
-
-      - name: Docker metadata — agent-chromium
-        id: meta-agent
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/jbrowser-agent-chromium
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      - name: Build & Push — agent-chromium
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.agent-chromium
-          push: true
-          tags: ${{ steps.meta-agent.outputs.tags }}
-          labels: ${{ steps.meta-agent.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
-          cache-from: type=gha,scope=agent-chromium
-          cache-to: type=gha,scope=agent-chromium,mode=max
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,scope=${{ matrix.scope }},mode=max
