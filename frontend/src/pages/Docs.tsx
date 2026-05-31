@@ -27,43 +27,23 @@ export function Docs({ tenantId }: Props) {
       <section className="docs-section">
         <h2 className="docs-h2">
           <span className="docs-step-badge">1</span>
-          Create a Registration Token
-        </h2>
-        <p>
-          Go to <a href={`/tenants/${tid}/settings/agent-tokens`} className="docs-link">Settings → Agent Tokens</a> and
-          create a new registration token. Copy the token — you'll need it to start agents.
-        </p>
-        <p>Or use the API:</p>
-        <div className="docs-code">
-          <pre><code>{`curl -X POST https://${host}/api/v1/tenants/${tid || '<tenant_id>'}/agent-registration-tokens \\
-  -H "Authorization: Bearer <jwt>" \\
-  -H "Content-Type: application/json" \\
-  -d '{"name": "my-fleet"}'`}</code></pre>
-        </div>
-      </section>
-
-      {/* Step 2 */}
-      <section className="docs-section">
-        <h2 className="docs-h2">
-          <span className="docs-step-badge">2</span>
           Deploy an Agent
         </h2>
         <p>
-          Run the agent container with your registration token. The agent will automatically
-          connect to the control plane and register a browser instance.
+          Go to <a href={`/tenants/${tid}/agents`} className="docs-link">Agents</a> and click{' '}
+          <strong>New agent</strong>. A registration token will be auto-generated and bound to your tenant.
+          Follow the setup instructions shown there to start an agent container.
         </p>
 
         <h3 className="docs-h3">Docker Compose</h3>
         <div className="docs-code">
-          <pre><code>{`version: "3.8"
-services:
+          <pre><code>{`services:
   agent:
-    image: jbrowser/agent-chromium:latest
-    environment:
-      - CONTROL_PLANE_URL=wss://${host}
-      - REGISTRATION_TOKEN=\${REGISTRATION_TOKEN}
-      - AGENT_NAME=chrome-01
+    image: ghcr.io/cnjack/jbrowser-agent-chromium:latest
     shm_size: "1gb"
+    environment:
+      CONTROL_PLANE_URL: wss://${host}
+      REGISTRATION_TOKEN: <token from Agents page>
     restart: unless-stopped`}</code></pre>
         </div>
 
@@ -74,8 +54,7 @@ services:
   --shm-size=1g \\
   -e CONTROL_PLANE_URL=wss://${host} \\
   -e REGISTRATION_TOKEN=<token> \\
-  -e AGENT_NAME=chrome-01 \\
-  jbrowser/agent-chromium:latest`}</code></pre>
+  ghcr.io/cnjack/jbrowser-agent-chromium:latest`}</code></pre>
         </div>
 
         <h3 className="docs-h3">Kubernetes (Helm)</h3>
@@ -92,10 +71,10 @@ services:
         </div>
       </section>
 
-      {/* Step 3 */}
+      {/* Step 2 */}
       <section className="docs-section">
         <h2 className="docs-h2">
-          <span className="docs-step-badge">3</span>
+          <span className="docs-step-badge">2</span>
           Get a CDP API Key
         </h2>
         <p>
@@ -108,10 +87,10 @@ services:
         </div>
       </section>
 
-      {/* Step 4 */}
+      {/* Step 3 */}
       <section className="docs-section">
         <h2 className="docs-h2">
-          <span className="docs-step-badge">4</span>
+          <span className="docs-step-badge">3</span>
           Connect with CDP
         </h2>
         <p>
@@ -148,7 +127,7 @@ await page.goto('https://example.com');`}</code></pre>
       {/* API Reference */}
       <section className="docs-section">
         <h2 className="docs-h2">
-          <span className="docs-step-badge">5</span>
+          <span className="docs-step-badge">4</span>
           REST API Reference
         </h2>
         <div className="docs-api-table">
@@ -170,8 +149,7 @@ await page.goto('https://example.com');`}</code></pre>
               <tr><td className="cell-mono">POST</td><td className="cell-mono">/api/v1/tenants/:tid/tokens/cdp</td><td>Create CDP token</td></tr>
               <tr><td className="cell-mono">POST</td><td className="cell-mono">/api/v1/tenants/:tid/tokens/cdp/:id/revoke</td><td>Revoke CDP token</td></tr>
               <tr><td className="cell-mono">POST</td><td className="cell-mono">/api/v1/tenants/:tid/tokens/cdp/:id/rotate</td><td>Rotate CDP token</td></tr>
-              <tr><td className="cell-mono">POST</td><td className="cell-mono">/api/v1/tenants/:tid/agent-registration-tokens</td><td>Create registration token</td></tr>
-              <tr><td className="cell-mono">POST</td><td className="cell-mono">/api/v1/tenants/:tid/agent-registration-tokens/:id/revoke</td><td>Revoke registration token</td></tr>
+              <tr><td className="cell-mono">POST</td><td className="cell-mono">/api/v1/tenants/:tid/agent-registration-tokens</td><td>Generate agent registration token (auto-bound to tenant)</td></tr>
             </tbody>
           </table>
         </div>

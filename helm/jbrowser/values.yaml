@@ -1,6 +1,6 @@
 image:
-  control: jbrowser-control:latest
-  agent: jbrowser-agent-chromium:latest
+  control: ghcr.io/cnjack/jbrowser-control:latest
+  agent: ghcr.io/cnjack/jbrowser-agent-chromium:latest
 
 control:
   replicas: 1

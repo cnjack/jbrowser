@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{env, path::PathBuf, sync::OnceLock, time::Duration, collections::HashMap};
 
 use anyhow::Context;
 use base64::Engine;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::{
     fs,
     process::{Child, Command},
-    sync::{broadcast, mpsc, Mutex},
+    sync::{broadcast, mpsc, watch, Mutex, RwLock},
     time::interval,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -27,6 +27,49 @@ static INPUT_TX: OnceLock<mpsc::Sender<serde_json::Value>> = OnceLock::new();
 
 fn input_tx() -> Option<&'static mpsc::Sender<serde_json::Value>> {
     INPUT_TX.get()
+}
+
+// ── Global CDP tunnel sessions ─────────────────────────────────────────────
+// Maps session_id → mpsc::Sender<String> for forwarding CDP messages to Chrome.
+// Each tunnel session is a tokio task that holds a CDP WebSocket to Chrome.
+static CDP_TUNNELS: OnceLock<Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>> = OnceLock::new();
+
+fn cdp_tunnels() -> &'static Arc<RwLock<HashMap<String, mpsc::Sender<String>>>> {
+    CDP_TUNNELS.get().expect("CDP_TUNNELS not set")
+}
+
+// ── Global control-plane sender ────────────────────────────────────────────
+// Used by CDP tunnel tasks to send responses back to the control plane.
+// Wrapped in Mutex because the agent may reconnect, replacing the sender.
+static CONTROL_TX: OnceLock<Mutex<Option<mpsc::Sender<Message>>>> = OnceLock::new();
+
+async fn send_to_control(msg: Message) -> bool {
+    if let Some(lock) = CONTROL_TX.get() {
+        let guard = lock.lock().await;
+        if let Some(tx) = guard.as_ref() {
+            return tx.try_send(msg).is_ok();
+        }
+    }
+    false
+}
+
+// ── Global active-tab tracker ──────────────────────────────────────────────
+// A watch channel whose value is the CDP target ID of the currently active tab.
+// When the user switches tabs, the sender updates the value, causing screencast
+// and input loops to reconnect to the new target.
+static ACTIVE_TAB_TX: OnceLock<watch::Sender<Option<String>>> = OnceLock::new();
+
+fn active_tab_rx() -> watch::Receiver<Option<String>> {
+    ACTIVE_TAB_TX
+        .get()
+        .expect("ACTIVE_TAB_TX not set")
+        .subscribe()
+}
+
+fn set_active_tab(tab_id: &str) {
+    if let Some(tx) = ACTIVE_TAB_TX.get() {
+        tx.send_replace(Some(tab_id.to_string()));
+    }
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -54,11 +97,20 @@ async fn main() -> anyhow::Result<()> {
     // Last frame cache: screencast stores the latest frame for immediate delivery
     let last_frame: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
 
+    // Active tab watch channel: screencast + input loops reconnect when this changes
+    let (active_tab_tx, _) = watch::channel::<Option<String>>(None);
+    ACTIVE_TAB_TX.set(active_tab_tx).expect("ACTIVE_TAB_TX already set");
+
     // Persistent input channel: all input/navigate commands go through here
     // to avoid creating a new CDP WS connection per event.
     let (input_chan_tx, input_chan_rx) = mpsc::channel::<serde_json::Value>(256);
     INPUT_TX.set(input_chan_tx).expect("input_tx already set");
     tokio::spawn(input_loop(input_chan_rx));
+
+    // CDP tunnel sessions map
+    CDP_TUNNELS
+        .set(Arc::new(RwLock::new(HashMap::new())))
+        .expect("CDP_TUNNELS already set");
 
     // Start CDP screencast task
     tokio::spawn(screencast_loop(video_tx.clone(), last_frame.clone()));
@@ -155,6 +207,7 @@ async fn start_chrome() -> anyhow::Result<Child> {
             "--remote-debugging-address=0.0.0.0",
             "--disable-gpu",
             "--window-size=1280,720",
+            "--force-device-scale-factor=1",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-extensions",
@@ -196,10 +249,17 @@ async fn start_chrome() -> anyhow::Result<Child> {
 /// JPEG frames to all connected WS clients.
 async fn screencast_loop(video_tx: broadcast::Sender<Bytes>, last_frame: Arc<Mutex<Option<Bytes>>>) {
     loop {
-        if let Err(e) = run_screencast(&video_tx, &last_frame).await {
-            warn!("screencast error: {e}");
+        match run_screencast(&video_tx, &last_frame).await {
+            Ok(()) => {
+                // Clean exit (e.g. tab switch) — reconnect quickly
+                info!("screencast session ended, reconnecting in 100ms");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                warn!("screencast error: {e}, reconnecting in 2s");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -209,12 +269,35 @@ async fn run_screencast(video_tx: &broadcast::Sender<Bytes>, last_frame: &Arc<Mu
         .as_str()
         .context("target missing webSocketDebuggerUrl")?;
 
-    let (mut cdp_ws, _) = connect_async(ws_url)
+    let (cdp_ws, _) = connect_async(ws_url)
         .await
         .context("CDP WS connect failed")?;
 
+    // Split so we can read + write concurrently in select!
+    let (mut ws_write, mut ws_read) = cdp_ws.split();
+
+    // Lock viewport to exactly 1280x720 with DPR=1 so that the screencast
+    // image dimensions match the coordinate space used by Input.dispatch*.
+    // Without this, headless Chrome's actual viewport may differ from
+    // --window-size, causing coordinate drift.
+    ws_write
+        .send(Message::Text(
+            json!({
+                "id": 0,
+                "method": "Emulation.setDeviceMetricsOverride",
+                "params": {
+                    "width": 1280,
+                    "height": 720,
+                    "deviceScaleFactor": 1,
+                    "mobile": false
+                }
+            })
+            .to_string(),
+        ))
+        .await?;
+
     // Start screencast
-    cdp_ws.send(Message::Text(
+    ws_write.send(Message::Text(
         json!({
             "id": 1,
             "method": "Page.startScreencast",
@@ -232,53 +315,62 @@ async fn run_screencast(video_tx: &broadcast::Sender<Bytes>, last_frame: &Arc<Mu
 
     info!("CDP screencast started");
     let mut sequence: u64 = 0;
+    let mut tab_rx = active_tab_rx();
 
     loop {
-        match cdp_ws.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-                    continue;
-                };
+        tokio::select! {
+            msg_result = ws_read.next() => {
+                match msg_result {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
 
-                if value.get("method").and_then(|v| v.as_str()) == Some("Page.screencastFrame") {
-                    let params = &value["params"];
-                    let session_id = params["sessionId"].as_i64().unwrap_or(0);
-                    let data_b64 = params["data"].as_str().unwrap_or("");
+                        if value.get("method").and_then(|v| v.as_str()) == Some("Page.screencastFrame") {
+                            let params = &value["params"];
+                            let session_id = params["sessionId"].as_i64().unwrap_or(0);
+                            let data_b64 = params["data"].as_str().unwrap_or("");
 
-                    // Decode base64 JPEG
-                    if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
-                        let ts = Utc::now().timestamp_millis() as u64;
-                        let encoded = encode_video_frame(&VideoFrame {
-                            frame_type: VideoFrameType::Jpeg,
-                            stream_id: 0,
-                            sequence,
-                            timestamp_ms: ts,
-                            payload: Bytes::from(jpeg_bytes),
-                        });
-                        sequence += 1;
-                        // Always send — drops are fine when no subscribers
-                        let _ = video_tx.send(encoded.clone());
-                        // Cache for instant delivery on reconnect
-                        *last_frame.lock().await = Some(encoded);
+                            // Decode base64 JPEG
+                            if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                let ts = Utc::now().timestamp_millis() as u64;
+                                let encoded = encode_video_frame(&VideoFrame {
+                                    frame_type: VideoFrameType::Jpeg,
+                                    stream_id: 0,
+                                    sequence,
+                                    timestamp_ms: ts,
+                                    payload: Bytes::from(jpeg_bytes),
+                                });
+                                sequence += 1;
+                                // Always send — drops are fine when no subscribers
+                                let _ = video_tx.send(encoded.clone());
+                                // Cache for instant delivery on reconnect
+                                *last_frame.lock().await = Some(encoded);
+                            }
+
+                            // Acknowledge the frame
+                            let ack = json!({
+                                "id": 100 + session_id,
+                                "method": "Page.screencastFrameAck",
+                                "params": { "sessionId": session_id }
+                            });
+                            if ws_write.send(Message::Text(ack.to_string())).await.is_err() {
+                                break;
+                            }
+                        }
                     }
-
-                    // Acknowledge the frame
-                    let ack = json!({
-                        "id": 100 + session_id,
-                        "method": "Page.screencastFrameAck",
-                        "params": { "sessionId": session_id }
-                    });
-                    if cdp_ws.send(Message::Text(ack.to_string())).await.is_err() {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        error!("CDP WS error: {e}");
                         break;
                     }
+                    _ => {}
                 }
             }
-            Some(Ok(Message::Close(_))) | None => break,
-            Some(Err(e)) => {
-                error!("CDP WS error: {e}");
+            _ = tab_rx.changed() => {
+                info!("active tab changed, reconnecting screencast");
                 break;
             }
-            _ => {}
         }
     }
 
@@ -346,10 +438,15 @@ async fn video_stream_task(
 async fn input_loop(mut rx: mpsc::Receiver<serde_json::Value>) {
     loop {
         match run_input_session(&mut rx).await {
-            Ok(()) => warn!("input CDP session closed, reconnecting in 500ms"),
-            Err(e) => warn!("input CDP session error: {e}, reconnecting in 500ms"),
+            Ok(()) => {
+                info!("input CDP session ended, reconnecting in 100ms");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                warn!("input CDP session error: {e}, reconnecting in 500ms");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -364,7 +461,25 @@ async fn run_input_session(rx: &mut mpsc::Receiver<serde_json::Value>) -> anyhow
     let (mut write, mut read) = ws.split();
     info!("input CDP session connected");
 
+    // Ensure viewport override is applied (same as screencast session)
+    write
+        .send(Message::Text(
+            json!({
+                "id": 999,
+                "method": "Emulation.setDeviceMetricsOverride",
+                "params": {
+                    "width": 1280,
+                    "height": 720,
+                    "deviceScaleFactor": 1,
+                    "mobile": false
+                }
+            })
+            .to_string(),
+        ))
+        .await?;
+
     let mut cmd_id: u64 = 1000;
+    let mut tab_rx = active_tab_rx();
     loop {
         tokio::select! {
             msg = rx.recv() => {
@@ -383,6 +498,10 @@ async fn run_input_session(rx: &mut mpsc::Receiver<serde_json::Value>) -> anyhow
                     Some(Err(e)) => return Err(e.into()),
                     Some(Ok(_)) => {} // ignore CDP responses
                 }
+            }
+            _ = tab_rx.changed() => {
+                info!("active tab changed, reconnecting input session");
+                return Ok(());
             }
         }
     }
@@ -483,8 +602,23 @@ async fn cdp_get_targets() -> anyhow::Result<Vec<serde_json::Value>> {
 }
 
 async fn ensure_page_target() -> anyhow::Result<serde_json::Value> {
-    if let Some(target) = cdp_get_targets()
-        .await?
+    let targets = cdp_get_targets().await?;
+
+    // Prefer the explicitly activated tab if one was set
+    if let Some(tx) = ACTIVE_TAB_TX.get() {
+        let active_id = tx.borrow().clone();
+        if let Some(id) = &active_id {
+            if let Some(target) = targets
+                .iter()
+                .find(|t| t["id"].as_str() == Some(id.as_str()) && t["type"].as_str() == Some("page"))
+            {
+                return Ok(target.clone());
+            }
+        }
+    }
+
+    // Fallback: first page target
+    if let Some(target) = targets
         .into_iter()
         .find(|t| t["type"].as_str() == Some("page"))
     {
@@ -512,15 +646,27 @@ async fn ensure_page_target() -> anyhow::Result<serde_json::Value> {
 }
 
 fn cdp_to_browser_tabs(targets: &[serde_json::Value]) -> Vec<BrowserTab> {
+    // Read the explicitly activated tab ID if one was set
+    let active_tab_id = ACTIVE_TAB_TX
+        .get()
+        .and_then(|tx| tx.borrow().clone());
+
     targets
         .iter()
         .filter(|t| t["type"].as_str() == Some("page"))
         .enumerate()
-        .map(|(i, t)| BrowserTab {
-            id: t["id"].as_str().unwrap_or("").to_string(),
-            title: t["title"].as_str().unwrap_or("").to_string(),
-            url: t["url"].as_str().unwrap_or("").to_string(),
-            active: i == 0, // first tab is always treated as active (main screencast target)
+        .map(|(i, t)| {
+            let id = t["id"].as_str().unwrap_or("").to_string();
+            let is_active = match &active_tab_id {
+                Some(active_id) => id == *active_id,
+                None => i == 0, // default: first tab is active
+            };
+            BrowserTab {
+                id,
+                title: t["title"].as_str().unwrap_or("").to_string(),
+                url: t["url"].as_str().unwrap_or("").to_string(),
+                active: is_active,
+            }
         })
         .collect()
 }
@@ -593,11 +739,19 @@ async fn handle_tab_command(payload: &serde_json::Value) -> anyhow::Result<()> {
         }
         "activate" => {
             if let Some(tab_id) = payload["tabId"].as_str() {
-                client
-                    .post(format!("http://localhost:9222/json/activate/{tab_id}"))
+                // Try /json/activate but don't let it block set_active_tab —
+                // in headless mode it may fail or be a no-op.
+                match client
+                    .get(format!("http://localhost:9222/json/activate/{tab_id}"))
                     .send()
-                    .await?
-                    .error_for_status()?;
+                    .await
+                {
+                    Ok(resp) => info!("json/activate/{tab_id} → {}", resp.status()),
+                    Err(e) => warn!("json/activate/{tab_id} failed: {e}"),
+                }
+                // Always signal screencast + input loops to reconnect
+                info!("set_active_tab → {tab_id}");
+                set_active_tab(tab_id);
             }
         }
         other => warn!("unknown tab command: {other}"),
@@ -684,6 +838,18 @@ async fn dispatch_control_message(msg: ControlToAgentMessage) {
         "input.event" => handle_input_event(&msg.payload).await,
         "tab.command" => handle_tab_command(&msg.payload).await,
         "browser.reset" => handle_browser_reset(&msg.payload).await,
+        "cdp.tunnel.open" => {
+            handle_cdp_tunnel_open(&msg.payload).await;
+            Ok(())
+        }
+        "cdp.tunnel.message" => {
+            handle_cdp_tunnel_message(&msg.payload).await;
+            Ok(())
+        }
+        "cdp.tunnel.close" => {
+            handle_cdp_tunnel_close(&msg.payload).await;
+            Ok(())
+        }
         other => {
             info!("unhandled control message kind: {other}");
             Ok(())
@@ -692,6 +858,155 @@ async fn dispatch_control_message(msg: ControlToAgentMessage) {
     if let Err(e) = result {
         warn!("control message '{}' error: {e}", msg.kind);
     }
+}
+
+// ── CDP Tunnel handlers ──────────────────────────────────────────────────────
+
+async fn handle_cdp_tunnel_open(payload: &serde_json::Value) {
+    let session_id = match payload["session_id"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            warn!("cdp.tunnel.open: missing session_id");
+            return;
+        }
+    };
+    let target_id = match payload["target_id"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            warn!("cdp.tunnel.open: missing target_id");
+            return;
+        }
+    };
+
+    info!(%session_id, %target_id, "opening CDP tunnel session");
+
+    // Find the WebSocket URL for this target
+    let targets = match cdp_get_targets().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("cdp.tunnel.open: failed to get targets: {e}");
+            return;
+        }
+    };
+
+    let ws_url = targets
+        .iter()
+        .find(|t| t["id"].as_str() == Some(&target_id))
+        .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+        .map(String::from);
+
+    let ws_url = match ws_url {
+        Some(u) => u,
+        None => {
+            warn!(%session_id, %target_id, "cdp.tunnel.open: target not found");
+            return;
+        }
+    };
+
+    // Create a channel for sending CDP messages from the control plane to this tunnel
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<String>(256);
+
+    // Register the tunnel
+    cdp_tunnels().write().await.insert(session_id.clone(), tunnel_tx);
+
+    // Spawn a task to handle bidirectional forwarding
+    let sid = session_id.clone();
+    tokio::spawn(async move {
+        let result = run_cdp_tunnel_session(&sid, &ws_url, &mut tunnel_rx).await;
+        if let Err(e) = result {
+            warn!(session_id = %sid, "CDP tunnel session error: {e}");
+        }
+        // Cleanup
+        cdp_tunnels().write().await.remove(&sid);
+        info!(session_id = %sid, "CDP tunnel session ended");
+    });
+}
+
+async fn run_cdp_tunnel_session(
+    session_id: &str,
+    ws_url: &str,
+    tunnel_rx: &mut mpsc::Receiver<String>,
+) -> anyhow::Result<()> {
+    let (cdp_ws, _) = connect_async(ws_url)
+        .await
+        .context("CDP tunnel WS connect failed")?;
+    let (mut cdp_write, mut cdp_read) = cdp_ws.split();
+
+    info!(%session_id, "CDP tunnel connected to Chrome");
+
+    loop {
+        tokio::select! {
+            // Messages from control plane (originated from CDP client) → forward to Chrome
+            msg = tunnel_rx.recv() => {
+                match msg {
+                    Some(text) => {
+                        if cdp_write.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break, // channel closed
+                }
+            }
+            // Messages from Chrome → send back to control plane
+            msg = cdp_read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let response = json!({
+                            "type": "cdp.tunnel.message",
+                            "payload": {
+                                "session_id": session_id,
+                                "data": text
+                            }
+                        });
+                        if !send_to_control(
+                            tokio_tungstenite::tungstenite::Message::Text(response.to_string())
+                        ).await {
+                            warn!(%session_id, "failed to send CDP tunnel response to control plane");
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        warn!(%session_id, "CDP tunnel Chrome WS error: {e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_cdp_tunnel_message(payload: &serde_json::Value) {
+    let session_id = match payload["session_id"].as_str() {
+        Some(s) => s,
+        None => return,
+    };
+    let data = match payload["data"].as_str() {
+        Some(d) => d.to_string(),
+        None => return,
+    };
+
+    let tunnels = cdp_tunnels().read().await;
+    if let Some(tx) = tunnels.get(session_id) {
+        if tx.try_send(data).is_err() {
+            warn!(%session_id, "CDP tunnel message send failed (channel full or closed)");
+        }
+    } else {
+        warn!(%session_id, "CDP tunnel session not found");
+    }
+}
+
+async fn handle_cdp_tunnel_close(payload: &serde_json::Value) {
+    let session_id = match payload["session_id"].as_str() {
+        Some(s) => s,
+        None => return,
+    };
+    info!(%session_id, "closing CDP tunnel session");
+    // Removing the sender will cause the tunnel_rx to return None, ending the task
+    cdp_tunnels().write().await.remove(session_id);
 }
 
 // ── WebSocket connect loop ───────────────────────────────────────────────────
@@ -743,6 +1058,13 @@ async fn connect_once(
     info!("agent websocket connected");
 
     let (tx, mut rx) = mpsc::channel::<Message>(256);
+
+    // Set global CONTROL_TX so CDP tunnel tasks can send responses back
+    // We replace it on each connection (agent reconnects produce a new channel).
+    {
+        let lock = CONTROL_TX.get_or_init(|| Mutex::new(None));
+        *lock.lock().await = Some(tx.clone());
+    }
 
     let writer_handle = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

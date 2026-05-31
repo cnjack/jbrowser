@@ -83,3 +83,10 @@ export async function revokeAgentToken(tenantId: string, tokenId: string) {
   });
 }
 
+export async function generateAgentToken(tenantId: string) {
+  return api<{ data: TokenRecord; token: string }>(`/api/v1/tenants/${tenantId}/agent-registration-tokens`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+

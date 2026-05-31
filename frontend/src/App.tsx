@@ -1,12 +1,47 @@
+import React from 'react';
 import { Landing } from './pages/Landing';
 import { Login } from './pages/Login';
 import { BrowserList } from './pages/BrowserList';
 import { BrowserDetail } from './pages/BrowserDetail';
 import { Agents } from './pages/Agents';
 import { ApiKeys } from './pages/ApiKeys';
-import { AgentTokens } from './pages/AgentTokens';
-import { Docs } from './pages/Docs';
+import {
+  DocsOverview,
+  DocsQuickstart,
+  DocsDeployAgent,
+  DocsCdpConnect,
+  DocsAiAgents,
+  DocsRestApi,
+  DocsCdpApi,
+  DocsWebSocket,
+  DocsArchitecture,
+  DocsSecurity,
+} from './pages/docs';
 import { useAuthStore } from './stores/auth';
+
+// ── Docs slug → component mapping ───────────────────────────────────────────
+
+const docsPages: Record<string, React.FC<{ tenantId?: string }>> = {
+  '': DocsOverview,
+  quickstart: DocsQuickstart,
+  'guides/deploy-agent': DocsDeployAgent,
+  'guides/cdp-connect': DocsCdpConnect,
+  'guides/ai-agents': DocsAiAgents,
+  'api/rest': DocsRestApi,
+  'api/cdp': DocsCdpApi,
+  'api/websocket': DocsWebSocket,
+  'concepts/architecture': DocsArchitecture,
+  'concepts/security': DocsSecurity,
+};
+
+function resolveDocsPage(
+  slug: string,
+  tenantId?: string,
+): React.ReactElement | null {
+  const Component = docsPages[slug];
+  if (!Component) return null;
+  return <Component tenantId={tenantId} />;
+}
 
 export function App() {
   const token = useAuthStore((state) => state.token);
@@ -18,9 +53,13 @@ export function App() {
     return <Login />;
   }
 
-  // Docs page (works both logged in and out)
-  if (path === '/docs') {
-    return <Docs />;
+  // Docs pages (works both logged in and out)
+  // Public: /docs, /docs/quickstart, /docs/guides/cdp-connect, …
+  const publicDocsMatch = path.match(/^\/docs(?:\/(.*))?$/);
+  if (publicDocsMatch) {
+    const slug = publicDocsMatch[1] || '';
+    const page = resolveDocsPage(slug);
+    return page ?? <DocsOverview />;
   }
 
   // Landing page for unauthenticated root
@@ -47,14 +86,13 @@ export function App() {
     return <ApiKeys tenantId={apiKeysMatch[1]} />;
   }
 
-  const agentTokensMatch = path.match(/^\/tenants\/([^/]+)\/settings\/agent-tokens$/);
-  if (agentTokensMatch) {
-    return <AgentTokens tenantId={agentTokensMatch[1]} />;
-  }
-
-  const docsMatch = path.match(/^\/tenants\/([^/]+)\/docs$/);
+  // Authenticated docs: /tenants/:tid/docs, /tenants/:tid/docs/quickstart, …
+  const docsMatch = path.match(/^\/tenants\/([^/]+)\/docs(?:\/(.*))?$/);
   if (docsMatch) {
-    return <Docs tenantId={docsMatch[1]} />;
+    const tid = docsMatch[1];
+    const slug = docsMatch[2] || '';
+    const page = resolveDocsPage(slug, tid);
+    return page ?? <DocsOverview tenantId={tid} />;
   }
 
   return <BrowserList tenantId={tenantId} />;

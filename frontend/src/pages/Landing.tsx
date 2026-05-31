@@ -149,7 +149,7 @@ export function Landing() {
                   <span className="code-comment"># docker-compose.yml</span>{'\n'}
                   <span className="code-key">services</span>:{'\n'}
                   {'  '}<span className="code-key">agent</span>:{'\n'}
-                  {'    '}<span className="code-key">image</span>: jbrowser/agent-chromium:latest{'\n'}
+                  {'    '}<span className="code-key">image</span>: ghcr.io/cnjack/jbrowser-agent-chromium:latest{'\n'}
                   {'    '}<span className="code-key">environment</span>:{'\n'}
                   {'      '}- CONTROL_PLANE_URL=wss://control.example.com{'\n'}
                   {'      '}- REGISTRATION_TOKEN=${'${TOKEN}'}

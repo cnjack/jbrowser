@@ -220,7 +220,7 @@ setup:
 	echo "    -e CONTROL_PLANE_WS_URL=$$(echo $(API_URL) | sed 's/http/ws/') \\" && \
 	echo "    -e REGISTRATION_TOKEN=$$REG_TOKEN \\" && \
 	echo "    -e AGENT_NAME=my-agent \\" && \
-	echo "    jbrowser-agent:dev"
+echo "    ghcr.io/cnjack/jbrowser-agent-chromium:latest"
 
 # ── Lint / Format ────────────────────────────────────────────────────────────
 

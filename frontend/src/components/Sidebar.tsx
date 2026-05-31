@@ -2,7 +2,7 @@ import { Globe, LogOut } from 'lucide-react';
 import { useAuthStore } from '../stores/auth';
 
 interface Props {
-  activePage: 'browsers' | 'agents' | 'api-keys' | 'agent-tokens' | 'docs';
+  activePage: 'browsers' | 'agents' | 'api-keys' | 'docs';
   tenantId: string;
   browserCount?: number;
 }
@@ -61,13 +61,6 @@ export function Sidebar({ activePage, tenantId, browserCount }: Props) {
         >
           <svg viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" /></svg>
           API Keys
-        </a>
-        <a
-          href={`/tenants/${tenantId}/settings/agent-tokens`}
-          className={`nav-item${activePage === 'agent-tokens' ? ' active' : ''}`}
-        >
-          <svg viewBox="0 0 24 24"><path d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-          Agent Tokens
         </a>
       </nav>
 

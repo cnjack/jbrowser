@@ -88,6 +88,8 @@ pub struct AppState {
     browser_last_frame: Arc<RwLock<HashMap<Uuid, Vec<u8>>>>,
     /// Per-browser event broadcast: browser_id → broadcast::Sender<String (JSON)>
     browser_events: Arc<RwLock<HashMap<Uuid, broadcast::Sender<String>>>>,
+    /// CDP tunnel: session_id → sender for forwarding CDP responses back to the CDP client
+    cdp_tunnel_senders: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
 }
 
 impl AppState {
@@ -102,6 +104,7 @@ impl AppState {
             browser_preview: Arc::new(RwLock::new(HashMap::new())),
             browser_last_frame: Arc::new(RwLock::new(HashMap::new())),
             browser_events: Arc::new(RwLock::new(HashMap::new())),
+            cdp_tunnel_senders: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -268,11 +271,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/cdp/tenants/:tenant_id/browser-instances/:browser_id/devtools/browser/:target_id",
-            get(cdp_ws_placeholder),
+            get(cdp_ws_tunnel),
         )
         .route(
             "/cdp/tenants/:tenant_id/browser-instances/:browser_id/devtools/page/:target_id",
-            get(cdp_ws_placeholder),
+            get(cdp_ws_tunnel),
         )
         .fallback_service(
             ServeDir::new("frontend/dist")
@@ -886,8 +889,25 @@ async fn handle_agent_socket(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            let msg_type = value.get("type").and_then(Value::as_str);
+
+                            // Route CDP tunnel responses back to the CDP client
+                            if msg_type == Some("cdp.tunnel.message") {
+                                if let Some(payload) = value.get("payload") {
+                                    if let (Some(session_id), Some(data)) = (
+                                        payload.get("session_id").and_then(Value::as_str),
+                                        payload.get("data").and_then(Value::as_str),
+                                    ) {
+                                        let senders = state.cdp_tunnel_senders.read().await;
+                                        if let Some(tx) = senders.get(session_id) {
+                                            let _ = tx.try_send(data.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
                             // Broadcast tab.list events to subscribed frontend clients
-                            if value.get("type").and_then(Value::as_str) == Some("tab.list") {
+                            if msg_type == Some("tab.list") {
                                 let _ = event_tx.send(text.clone());
                             }
                             handle_agent_text(&state, agent_id, browser_id, value).await;
@@ -1277,19 +1297,127 @@ async fn cdp_json_list(
     Ok(Json(json!(data)))
 }
 
-async fn cdp_ws_placeholder(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(|mut socket| async move {
-        let _ = socket
-            .send(Message::Text(
-                json!({
-                    "error": "CDP tunnel placeholder: agent byte-for-byte forwarding is deferred"
-                })
-                .to_string(),
-            ))
-            .await;
-        let _ = socket.close().await;
-    })
-    .into_response()
+async fn cdp_ws_tunnel(
+    State(state): State<AppState>,
+    Path((tenant_id, browser_id, target_id)): Path<(Uuid, Uuid, String)>,
+    Query(query): Query<CdpQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    validate_cdp_token(&state, tenant_id, &query.token).await?;
+
+    // Resolve agent_id for this browser instance
+    let agent_id = {
+        let store = state.store.read().await;
+        let browser = store
+            .browsers
+            .get(&browser_id)
+            .filter(|b| b.tenant_id == tenant_id)
+            .ok_or_else(|| AppError::not_found("browser instance"))?;
+        browser.agent_id
+    };
+
+    // Check the agent is connected
+    {
+        let senders = state.agent_senders.read().await;
+        if !senders.contains_key(&agent_id) {
+            return Err(AppError::bad_request("agent is not connected"));
+        }
+    }
+
+    Ok(ws
+        .on_upgrade(move |socket| {
+            handle_cdp_tunnel(state, agent_id, target_id, socket)
+        })
+        .into_response())
+}
+
+async fn handle_cdp_tunnel(
+    state: AppState,
+    agent_id: Uuid,
+    target_id: String,
+    socket: WebSocket,
+) {
+    let session_id = Uuid::now_v7().to_string();
+    info!(%session_id, %agent_id, %target_id, "CDP tunnel session opening");
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Channel for receiving CDP responses from the agent
+    let (response_tx, mut response_rx) = mpsc::channel::<String>(256);
+
+    // Register this tunnel session so the agent handler can route responses back
+    state
+        .cdp_tunnel_senders
+        .write()
+        .await
+        .insert(session_id.clone(), response_tx);
+
+    // Tell the agent to open a CDP connection for this target
+    {
+        let senders = state.agent_senders.read().await;
+        if let Some(tx) = senders.get(&agent_id) {
+            let open_msg = json!({
+                "type": "cdp.tunnel.open",
+                "payload": {
+                    "session_id": session_id,
+                    "target_id": target_id
+                }
+            });
+            let _ = tx.try_send(open_msg.to_string());
+        }
+    }
+
+    // Bidirectional forwarding loop
+    loop {
+        tokio::select! {
+            // CDP client → agent
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let senders = state.agent_senders.read().await;
+                        if let Some(tx) = senders.get(&agent_id) {
+                            let tunnel_msg = json!({
+                                "type": "cdp.tunnel.message",
+                                "payload": {
+                                    "session_id": session_id,
+                                    "data": text
+                                }
+                            });
+                            if tx.try_send(tunnel_msg.to_string()).is_err() {
+                                break;
+                            }
+                        } else {
+                            break; // agent disconnected
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            // Agent → CDP client
+            Some(response) = response_rx.recv() => {
+                if ws_tx.send(Message::Text(response)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Tell the agent to close the CDP connection
+    {
+        let senders = state.agent_senders.read().await;
+        if let Some(tx) = senders.get(&agent_id) {
+            let close_msg = json!({
+                "type": "cdp.tunnel.close",
+                "payload": { "session_id": session_id }
+            });
+            let _ = tx.try_send(close_msg.to_string());
+        }
+    }
+
+    // Cleanup
+    state.cdp_tunnel_senders.write().await.remove(&session_id);
+    info!(%session_id, "CDP tunnel session closed");
 }
 
 async fn validate_cdp_token(state: &AppState, tenant_id: Uuid, raw: &str) -> Result<(), AppError> {
@@ -1553,6 +1681,14 @@ impl AppError {
             status: StatusCode::NOT_FOUND,
             code: "NOT_FOUND",
             detail: format!("{resource} not found"),
+        }
+    }
+
+    fn bad_request(detail: impl Into<String>) -> Self {
+        Self::Http {
+            status: StatusCode::BAD_REQUEST,
+            code: "BAD_REQUEST",
+            detail: detail.into(),
         }
     }
 

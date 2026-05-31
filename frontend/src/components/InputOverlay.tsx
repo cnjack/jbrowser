@@ -49,6 +49,8 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
   const imgPoolRef = useRef<HTMLImageElement[]>([]);
   const [ripples, setRipples] = useState<{ id: number; x: number; y: number }[]>([]);
   const rippleId = useRef(0);
+  // Virtual cursor: tracks the mapped remote position and shows it on the canvas
+  const [virtualCursor, setVirtualCursor] = useState<{ x: number; y: number; visible: boolean }>({ x: 0, y: 0, visible: false });
 
   // Maintain correct aspect-ratio CSS dimensions so that mapCoordinates stays accurate.
   useEffect(() => {
@@ -56,10 +58,10 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     const canvas = canvasRef.current;
     if (!wrap || !canvas) return;
 
-    const vw = browser.viewport_width;
-    const vh = browser.viewport_height;
-
     const fit = () => {
+      // Use actual canvas pixel dimensions (updated when frames arrive)
+      const vw = canvas.width || browser.viewport_width;
+      const vh = canvas.height || browser.viewport_height;
       const scale = Math.min(wrap.clientWidth / vw, wrap.clientHeight / vh);
       canvas.style.width  = Math.floor(vw * scale) + 'px';
       canvas.style.height = Math.floor(vh * scale) + 'px';
@@ -90,6 +92,13 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     const blob = new Blob([jpeg], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
     img.onload = () => {
+      // If the actual frame dimensions differ from the canvas pixel dimensions,
+      // update the canvas to match. This keeps coordinate mapping accurate even
+      // when Chrome's real viewport doesn't match the assumed dimensions.
+      if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+      }
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       URL.revokeObjectURL(url);
       pool.push(img);
@@ -104,7 +113,10 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
 
     const mapCoords = (clientX: number, clientY: number) => {
       const rect = canvas.getBoundingClientRect();
-      return mapCoordinates(clientX, clientY, rect, browser.viewport_width, browser.viewport_height);
+      // Use canvas intrinsic pixel dimensions (which track the actual frame size)
+      // instead of browser.viewport_* to stay accurate when Chrome's real viewport
+      // differs from the declared dimensions.
+      return mapCoordinates(clientX, clientY, rect, canvas.width, canvas.height);
     };
 
     const handleWheel = (e: WheelEvent) => {
@@ -137,7 +149,20 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
 
     const handleMouseMove = (e: MouseEvent) => {
       const point = mapCoords(e.clientX, e.clientY);
+      // Update virtual cursor: convert remote coords back to canvas-local CSS pixels,
+      // offset by canvas position within wrap so it stays aligned when letterboxed.
+      const rect = canvas.getBoundingClientRect();
+      const wrapRect = wrapRef.current!.getBoundingClientRect();
+      setVirtualCursor({
+        x: (point.x / canvas.width) * rect.width + (rect.left - wrapRect.left),
+        y: (point.y / canvas.height) * rect.height + (rect.top - wrapRect.top),
+        visible: true,
+      });
       onInput({ type: 'mousemove', x: point.x, y: point.y, modifiers: getModifiers(e) });
+    };
+
+    const handleMouseLeave = () => {
+      setVirtualCursor((c) => ({ ...c, visible: false }));
     };
 
     const handleDblClick = (e: MouseEvent) => {
@@ -175,6 +200,7 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
     canvas.addEventListener('contextmenu', handleContextMenu);
     canvas.addEventListener('keydown', handleKeyDown);
     canvas.addEventListener('keyup', handleKeyUp);
+    canvas.addEventListener('mouseleave', handleMouseLeave);
 
     return () => {
       canvas.removeEventListener('wheel', handleWheel);
@@ -185,6 +211,7 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
       canvas.removeEventListener('contextmenu', handleContextMenu);
       canvas.removeEventListener('keydown', handleKeyDown);
       canvas.removeEventListener('keyup', handleKeyUp);
+      canvas.removeEventListener('mouseleave', handleMouseLeave);
     };
   }, [browser.viewport_width, browser.viewport_height, onInput]);
 
@@ -198,6 +225,25 @@ export function InputOverlay({ browser, onInput, previewSegment }: Props) {
         tabIndex={0}
         onClick={() => canvasRef.current?.focus()}
       />
+      {virtualCursor.visible && (
+        <svg
+          className="virtual-cursor"
+          style={{ left: virtualCursor.x, top: virtualCursor.y }}
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <path
+            d="M5 3l14 8.5-6.5 1.5-3 6.5z"
+            fill="rgba(255,60,60,0.85)"
+            stroke="#fff"
+            strokeWidth="1.5"
+            strokeLinejoin="round"
+          />
+        </svg>
+      )}
       {ripples.map((r) => (
         <span
           key={r.id}

@@ -24,6 +24,10 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 
   if (!response.ok) {
     const body = await response.json().catch(() => null);
+    if (response.status === 401) {
+      useAuthStore.getState().logout();
+      window.location.href = '/login';
+    }
     throw new ApiError(response.status, body);
   }
 
