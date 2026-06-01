@@ -25,7 +25,7 @@ use crate::db::repo;
 use crate::server::auth::crypto::hash_token;
 use crate::server::auth::middleware::bearer_token;
 use crate::server::error::AppError;
-use crate::server::state::AppState;
+use crate::server::state::{AppState, CdpTunnelEvent};
 
 pub async fn ws_agent(
     State(state): State<AppState>,
@@ -168,6 +168,19 @@ async fn handle_agent_socket(
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
                             let msg_type = value.get("type").and_then(Value::as_str);
 
+                            if msg_type == Some("cdp.tunnel.ready") {
+                                if let Some(session_id) = value
+                                    .get("payload")
+                                    .and_then(|payload| payload.get("session_id"))
+                                    .and_then(Value::as_str)
+                                {
+                                    let senders = state.cdp_tunnel_senders.read().await;
+                                    if let Some(tx) = senders.get(session_id) {
+                                        let _ = tx.try_send(CdpTunnelEvent::Ready);
+                                    }
+                                }
+                            }
+
                             if msg_type == Some("cdp.tunnel.message") {
                                 if let Some(payload) = value.get("payload") {
                                     if let (Some(session_id), Some(data)) = (
@@ -176,7 +189,8 @@ async fn handle_agent_socket(
                                     ) {
                                         let senders = state.cdp_tunnel_senders.read().await;
                                         if let Some(tx) = senders.get(session_id) {
-                                            let _ = tx.try_send(data.to_string());
+                                            let _ = tx
+                                                .try_send(CdpTunnelEvent::Message(data.to_string()));
                                         }
                                     }
                                 }

@@ -77,6 +77,20 @@ async fn run_cdp_tunnel_session(
     let (mut cdp_write, mut cdp_read) = cdp_ws.split();
 
     info!(%session_id, "CDP tunnel connected to Chrome");
+    let ready = json!({
+        "type": "cdp.tunnel.ready",
+        "payload": {
+            "session_id": session_id
+        }
+    });
+    if !send_to_control(tokio_tungstenite::tungstenite::Message::Text(
+        ready.to_string(),
+    ))
+    .await
+    {
+        warn!(%session_id, "failed to send CDP tunnel ready to control plane");
+        return Ok(());
+    }
 
     loop {
         tokio::select! {

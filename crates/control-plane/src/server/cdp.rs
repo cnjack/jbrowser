@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -16,7 +18,9 @@ use uuid::Uuid;
 use crate::db::repo;
 use crate::server::auth::crypto::hash_token;
 use crate::server::error::AppError;
-use crate::server::state::AppState;
+use crate::server::state::{AppState, CdpTunnelEvent};
+
+const CDP_TUNNEL_PENDING_LIMIT: usize = 256;
 
 #[derive(Debug, Deserialize)]
 pub struct CdpQuery {
@@ -111,7 +115,9 @@ async fn handle_cdp_tunnel(state: AppState, agent_id: Uuid, target_id: String, s
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let (response_tx, mut response_rx) = mpsc::channel::<String>(256);
+    let (response_tx, mut response_rx) = mpsc::channel::<CdpTunnelEvent>(256);
+    let mut cdp_ready = false;
+    let mut pending_client_messages = VecDeque::<String>::new();
 
     state
         .cdp_tunnel_senders
@@ -138,34 +144,73 @@ async fn handle_cdp_tunnel(state: AppState, agent_id: Uuid, target_id: String, s
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        let senders = state.agent_senders.read().await;
-                        if let Some(tx) = senders.get(&agent_id) {
-                            let tunnel_msg = json!({
-                                "type": "cdp.tunnel.message",
-                                "payload": {
-                                    "session_id": session_id,
-                                    "data": text
-                                }
-                            });
-                            if tx.try_send(tunnel_msg.to_string()).is_err() {
+                        if cdp_ready {
+                            if send_cdp_tunnel_message(&state, agent_id, &session_id, text).await.is_err() {
                                 break;
                             }
                         } else {
-                            break;
+                            if pending_client_messages.len() >= CDP_TUNNEL_PENDING_LIMIT {
+                                tracing::warn!(
+                                    %session_id,
+                                    pending = pending_client_messages.len(),
+                                    "CDP tunnel pending message buffer full before agent ready"
+                                );
+                                break;
+                            }
+                            pending_client_messages.push_back(text);
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
             }
-            Some(response) = response_rx.recv() => {
-                if ws_tx.send(Message::Text(response)).await.is_err() {
-                    break;
+            Some(event) = response_rx.recv() => {
+                match event {
+                    CdpTunnelEvent::Ready => {
+                        cdp_ready = true;
+                        while let Some(text) = pending_client_messages.pop_front() {
+                            if send_cdp_tunnel_message(&state, agent_id, &session_id, text).await.is_err() {
+                                return close_cdp_tunnel(state, agent_id, session_id).await;
+                            }
+                        }
+                    }
+                    CdpTunnelEvent::Message(response) => {
+                        if ws_tx.send(Message::Text(response)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
     }
 
+    close_cdp_tunnel(state, agent_id, session_id).await;
+}
+
+async fn send_cdp_tunnel_message(
+    state: &AppState,
+    agent_id: Uuid,
+    session_id: &str,
+    text: String,
+) -> Result<(), ()> {
+    let tx = {
+        let senders = state.agent_senders.read().await;
+        senders.get(&agent_id).cloned()
+    };
+    let Some(tx) = tx else {
+        return Err(());
+    };
+    let tunnel_msg = json!({
+        "type": "cdp.tunnel.message",
+        "payload": {
+            "session_id": session_id,
+            "data": text
+        }
+    });
+    tx.send(tunnel_msg.to_string()).await.map_err(|_| ())
+}
+
+async fn close_cdp_tunnel(state: AppState, agent_id: Uuid, session_id: String) {
     {
         let senders = state.agent_senders.read().await;
         if let Some(tx) = senders.get(&agent_id) {

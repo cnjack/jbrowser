@@ -10,6 +10,12 @@ use super::auth::crypto::{hash_password, hash_token};
 use super::config::AppConfig;
 use crate::db::repo;
 
+#[derive(Debug)]
+pub(crate) enum CdpTunnelEvent {
+    Ready,
+    Message(String),
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) config: AppConfig,
@@ -20,7 +26,7 @@ pub struct AppState {
     pub(crate) browser_preview: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Vec<u8>>>>>,
     pub(crate) browser_last_frame: Arc<RwLock<HashMap<Uuid, Vec<u8>>>>,
     pub(crate) browser_events: Arc<RwLock<HashMap<Uuid, broadcast::Sender<String>>>>,
-    pub(crate) cdp_tunnel_senders: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
+    pub(crate) cdp_tunnel_senders: Arc<RwLock<HashMap<String, mpsc::Sender<CdpTunnelEvent>>>>,
     /// browser_id → reset start time; while present, heartbeats must not overwrite status=Online
     pub(crate) pending_resets: Arc<RwLock<HashMap<Uuid, Instant>>>,
 }
