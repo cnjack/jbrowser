@@ -38,17 +38,13 @@ pub async fn cdp_json_version(
         .get(&browser_id)
         .filter(|browser| browser.tenant_id == tenant_id)
         .ok_or_else(|| AppError::not_found("browser instance"))?;
-    let target_id = browser
-        .active_tab_id
-        .clone()
-        .unwrap_or_else(|| "browser".to_string());
     Ok(Json(json!({
         "Browser": format!("Chrome/{}", browser.browser_version),
         "Protocol-Version": "1.3",
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome JBrowser",
         "V8-Version": "12.0.0",
         "WebKit-Version": "537.36",
-        "webSocketDebuggerUrl": format!("{}/cdp/tenants/{}/browser-instances/{}/devtools/browser/{}?token={}", ws_base_url(&state.config.public_base_url), tenant_id, browser_id, target_id, query.token)
+        "webSocketDebuggerUrl": format!("{}/cdp/tenants/{}/browser-instances/{}/devtools/browser/browser?token={}", ws_base_url(&state.config.public_base_url), tenant_id, browser_id, query.token)
     })))
 }
 

@@ -8,6 +8,8 @@ use tracing::{info, warn};
 use crate::chrome::cdp_get_targets;
 use crate::globals::{cdp_tunnels, send_to_control};
 
+const BROWSER_TARGET_ID: &str = "browser";
+
 pub(crate) async fn handle_cdp_tunnel_open(payload: &serde_json::Value) {
     let session_id = match payload["session_id"].as_str() {
         Some(s) => s.to_string(),
@@ -26,19 +28,29 @@ pub(crate) async fn handle_cdp_tunnel_open(payload: &serde_json::Value) {
 
     info!(%session_id, %target_id, "opening CDP tunnel session");
 
-    let targets = match cdp_get_targets().await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("cdp.tunnel.open: failed to get targets: {e}");
-            return;
+    let ws_url = if target_id == BROWSER_TARGET_ID {
+        match browser_websocket_url().await {
+            Ok(url) => Some(url),
+            Err(e) => {
+                warn!("cdp.tunnel.open: failed to get browser websocket URL: {e}");
+                return;
+            }
         }
-    };
+    } else {
+        let targets = match cdp_get_targets().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("cdp.tunnel.open: failed to get targets: {e}");
+                return;
+            }
+        };
 
-    let ws_url = targets
-        .iter()
-        .find(|t| t["id"].as_str() == Some(&target_id))
-        .and_then(|t| t["webSocketDebuggerUrl"].as_str())
-        .map(String::from);
+        targets
+            .iter()
+            .find(|t| t["id"].as_str() == Some(&target_id))
+            .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+            .map(String::from)
+    };
 
     let ws_url = match ws_url {
         Some(u) => u,
@@ -64,6 +76,21 @@ pub(crate) async fn handle_cdp_tunnel_open(payload: &serde_json::Value) {
         cdp_tunnels().write().await.remove(&sid);
         info!(session_id = %sid, "CDP tunnel session ended");
     });
+}
+
+async fn browser_websocket_url() -> anyhow::Result<String> {
+    let version = reqwest::Client::new()
+        .get("http://localhost:9222/json/version")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await
+        .context("failed to parse /json/version")?;
+    version["webSocketDebuggerUrl"]
+        .as_str()
+        .map(String::from)
+        .context("missing webSocketDebuggerUrl in /json/version")
 }
 
 async fn run_cdp_tunnel_session(
