@@ -3,8 +3,9 @@ use std::collections::VecDeque;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        OriginalUri, Path, Query, State,
     },
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -12,6 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 use tracing::info;
 use uuid::Uuid;
 
@@ -21,6 +23,7 @@ use crate::server::error::AppError;
 use crate::server::state::{AppState, CdpTunnelEvent};
 
 const CDP_TUNNEL_PENDING_LIMIT: usize = 256;
+const CDP_HTTP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 pub struct CdpQuery {
@@ -74,6 +77,81 @@ pub async fn cdp_json_list(
         })
         .collect::<Vec<_>>();
     Ok(Json(json!(data)))
+}
+
+pub async fn cdp_json_new(
+    State(state): State<AppState>,
+    Path((tenant_id, browser_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<CdpQuery>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Json<Value>, AppError> {
+    validate_cdp_token(&state, tenant_id, &query.token).await?;
+    let agent_id = resolve_agent_id(&state, tenant_id, browser_id).await?;
+    let url = parse_json_new_url(uri.query()).unwrap_or_else(|| "about:blank".to_string());
+    let created = run_browser_cdp_command(
+        &state,
+        agent_id,
+        "Target.createTarget",
+        json!({ "url": url }),
+    )
+    .await?;
+    let target_id = created["targetId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| AppError::internal("Target.createTarget returned no targetId"))?;
+    let target_info = run_browser_cdp_command(
+        &state,
+        agent_id,
+        "Target.getTargetInfo",
+        json!({ "targetId": target_id }),
+    )
+    .await
+    .ok()
+    .and_then(|value| value.get("targetInfo").cloned())
+    .unwrap_or_else(|| json!({}));
+
+    Ok(Json(json!({
+        "id": target_id,
+        "type": target_info["type"].as_str().unwrap_or("page"),
+        "title": target_info["title"].as_str().unwrap_or(""),
+        "url": target_info["url"].as_str().unwrap_or(""),
+        "webSocketDebuggerUrl": format!("{}/cdp/tenants/{}/browser-instances/{}/devtools/page/{}?token={}", ws_base_url(&state.config.public_base_url), tenant_id, browser_id, target_id, query.token),
+        "devtoolsFrontendUrl": format!("/devtools/inspector.html?ws=/cdp/tenants/{}/browser-instances/{}/devtools/page/{}", tenant_id, browser_id, target_id)
+    })))
+}
+
+pub async fn cdp_json_activate(
+    State(state): State<AppState>,
+    Path((tenant_id, browser_id, target_id)): Path<(Uuid, Uuid, String)>,
+    Query(query): Query<CdpQuery>,
+) -> Result<(StatusCode, String), AppError> {
+    validate_cdp_token(&state, tenant_id, &query.token).await?;
+    let agent_id = resolve_agent_id(&state, tenant_id, browser_id).await?;
+    run_browser_cdp_command(
+        &state,
+        agent_id,
+        "Target.activateTarget",
+        json!({ "targetId": target_id }),
+    )
+    .await?;
+    Ok((StatusCode::OK, "Target activated".to_string()))
+}
+
+pub async fn cdp_json_close(
+    State(state): State<AppState>,
+    Path((tenant_id, browser_id, target_id)): Path<(Uuid, Uuid, String)>,
+    Query(query): Query<CdpQuery>,
+) -> Result<(StatusCode, String), AppError> {
+    validate_cdp_token(&state, tenant_id, &query.token).await?;
+    let agent_id = resolve_agent_id(&state, tenant_id, browser_id).await?;
+    run_browser_cdp_command(
+        &state,
+        agent_id,
+        "Target.closeTarget",
+        json!({ "targetId": target_id }),
+    )
+    .await?;
+    Ok((StatusCode::OK, "Target is closing".to_string()))
 }
 
 pub async fn cdp_ws_tunnel(
@@ -204,6 +282,138 @@ async fn send_cdp_tunnel_message(
         }
     });
     tx.send(tunnel_msg.to_string()).await.map_err(|_| ())
+}
+
+async fn resolve_agent_id(
+    state: &AppState,
+    tenant_id: Uuid,
+    browser_id: Uuid,
+) -> Result<Uuid, AppError> {
+    let agent_id = {
+        let browsers = state.browsers.read().await;
+        let browser = browsers
+            .get(&browser_id)
+            .filter(|b| b.tenant_id == tenant_id)
+            .ok_or_else(|| AppError::not_found("browser instance"))?;
+        browser.agent_id
+    };
+
+    {
+        let senders = state.agent_senders.read().await;
+        if !senders.contains_key(&agent_id) {
+            return Err(AppError::bad_request("agent is not connected"));
+        }
+    }
+
+    Ok(agent_id)
+}
+
+async fn run_browser_cdp_command(
+    state: &AppState,
+    agent_id: Uuid,
+    method: &str,
+    params: Value,
+) -> Result<Value, AppError> {
+    let session_id = Uuid::now_v7().to_string();
+    let (response_tx, mut response_rx) = mpsc::channel::<CdpTunnelEvent>(256);
+
+    state
+        .cdp_tunnel_senders
+        .write()
+        .await
+        .insert(session_id.clone(), response_tx);
+
+    let result = async {
+        {
+            let senders = state.agent_senders.read().await;
+            let tx = senders
+                .get(&agent_id)
+                .ok_or_else(|| AppError::bad_request("agent is not connected"))?;
+            let open_msg = json!({
+                "type": "cdp.tunnel.open",
+                "payload": {
+                    "session_id": session_id,
+                    "target_id": "browser"
+                }
+            });
+            tx.send(open_msg.to_string())
+                .await
+                .map_err(|_| AppError::bad_request("agent is not connected"))?;
+        }
+
+        wait_for_cdp_ready(&mut response_rx).await?;
+        let command = json!({
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+        send_cdp_tunnel_message(state, agent_id, &session_id, command.to_string())
+            .await
+            .map_err(|_| AppError::bad_request("agent is not connected"))?;
+        wait_for_cdp_response(&mut response_rx, method).await
+    }
+    .await;
+
+    close_cdp_tunnel(state.clone(), agent_id, session_id).await;
+    result
+}
+
+async fn wait_for_cdp_ready(
+    response_rx: &mut mpsc::Receiver<CdpTunnelEvent>,
+) -> Result<(), AppError> {
+    timeout(CDP_HTTP_COMMAND_TIMEOUT, async {
+        while let Some(event) = response_rx.recv().await {
+            if matches!(event, CdpTunnelEvent::Ready) {
+                return Ok(());
+            }
+        }
+        Err(AppError::bad_request("CDP tunnel closed before ready"))
+    })
+    .await
+    .map_err(|_| AppError::service_unavailable("CDP tunnel ready timed out"))?
+}
+
+async fn wait_for_cdp_response(
+    response_rx: &mut mpsc::Receiver<CdpTunnelEvent>,
+    method: &str,
+) -> Result<Value, AppError> {
+    timeout(CDP_HTTP_COMMAND_TIMEOUT, async {
+        while let Some(event) = response_rx.recv().await {
+            let CdpTunnelEvent::Message(text) = event else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|e| AppError::internal(format!("invalid CDP response: {e}")))?;
+            if value["id"].as_u64() != Some(1) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                let message = error["message"].as_str().unwrap_or("CDP command failed");
+                return Err(AppError::bad_request(format!("{method} failed: {message}")));
+            }
+            return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
+        }
+        Err(AppError::bad_request("CDP tunnel closed before response"))
+    })
+    .await
+    .map_err(|_| AppError::service_unavailable(format!("{method} timed out")))?
+}
+
+fn parse_json_new_url(query: Option<&str>) -> Option<String> {
+    let query = query?.trim();
+    if query.is_empty() {
+        return None;
+    }
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "token" {
+            continue;
+        }
+        if key == "url" {
+            return Some(value.into_owned());
+        }
+        return Some(key.into_owned());
+    }
+    None
 }
 
 async fn close_cdp_tunnel(state: AppState, agent_id: Uuid, session_id: String) {

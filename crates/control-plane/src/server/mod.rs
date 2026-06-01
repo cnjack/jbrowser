@@ -140,6 +140,18 @@ pub fn build_router(state: AppState) -> Router {
             get(cdp::cdp_json_list),
         )
         .route(
+            "/cdp/tenants/:tenant_id/browser-instances/:browser_id/json/new",
+            get(cdp::cdp_json_new).put(cdp::cdp_json_new),
+        )
+        .route(
+            "/cdp/tenants/:tenant_id/browser-instances/:browser_id/json/activate/:target_id",
+            get(cdp::cdp_json_activate).put(cdp::cdp_json_activate),
+        )
+        .route(
+            "/cdp/tenants/:tenant_id/browser-instances/:browser_id/json/close/:target_id",
+            get(cdp::cdp_json_close).put(cdp::cdp_json_close),
+        )
+        .route(
             "/cdp/tenants/:tenant_id/browser-instances/:browser_id/devtools/browser/:target_id",
             get(cdp::cdp_ws_tunnel),
         )
