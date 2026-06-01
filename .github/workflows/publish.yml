@@ -25,26 +25,26 @@ jobs:
           - image: jbrowser-control
             file: docker/Dockerfile.control
             platform: linux/amd64
+            suffix: amd64
             runner: ubuntu-latest
-            artifact: digest-control-amd64
             cache-scope: control-amd64
           - image: jbrowser-control
             file: docker/Dockerfile.control
             platform: linux/arm64
+            suffix: arm64
             runner: ubuntu-24.04-arm
-            artifact: digest-control-arm64
             cache-scope: control-arm64
           - image: jbrowser-agent-chromium
             file: docker/Dockerfile.agent-chromium
             platform: linux/amd64
+            suffix: amd64
             runner: ubuntu-latest
-            artifact: digest-agent-amd64
             cache-scope: agent-amd64
           - image: jbrowser-agent-chromium
             file: docker/Dockerfile.agent-chromium
             platform: linux/arm64
+            suffix: arm64
             runner: ubuntu-24.04-arm
-            artifact: digest-agent-arm64
             cache-scope: agent-arm64
 
     steps:
@@ -61,32 +61,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push by digest
-        id: build
+      - name: Build & Push with temp tag
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.file }}
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image }},push-by-digest=true
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:temp-${{ matrix.suffix }}-${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max
           provenance: false
           sbom: false
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
 
   merge:
     name: Merge — ${{ matrix.image }}
@@ -101,18 +87,9 @@ jobs:
       matrix:
         include:
           - image: jbrowser-control
-            artifact-prefix: digest-control
           - image: jbrowser-agent-chromium
-            artifact-prefix: digest-agent
 
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: ${{ matrix.artifact-prefix }}-*
-          merge-multiple: true
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -135,16 +112,27 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Create manifest list and push
-        working-directory: /tmp/digests
         run: |
           TAG_ARGS=$(echo '${{ steps.meta.outputs.json }}' | jq -r '.tags | map("-t " + .) | join(" ")')
-          SOURCE_IMAGES=""
-          for digest_file in *; do
-            SOURCE_IMAGES="${SOURCE_IMAGES} ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@sha256:${digest_file}"
-          done
-          docker buildx imagetools create ${TAG_ARGS} ${SOURCE_IMAGES}
+          docker buildx imagetools create ${TAG_ARGS} \
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:temp-amd64-${{ github.sha }} \
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:temp-arm64-${{ github.sha }}
 
       - name: Inspect image
         run: |
           TAG=$(echo '${{ steps.meta.outputs.json }}' | jq -r '.tags[0]')
           docker buildx imagetools inspect "${TAG}"
+
+      - name: Delete temp tags
+        run: |
+          for arch in amd64 arm64; do
+            TAG="temp-${arch}-${{ github.sha }}"
+            IMAGE_ID=$(echo "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}" | tr '[:upper:]' '[:lower:]')
+            VERSION_ID=$(echo "${TAG}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+            TOKEN=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://ghcr.io/token?scope=package:delete:${IMAGE_ID}" | jq -r '.token' 2>/dev/null || true)
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+              curl -s -X DELETE \
+                -H "Authorization: Bearer ${TOKEN}" \
+                "https://ghcr.io/v2/${IMAGE_ID}/manifests/${VERSION_ID}" || true
+            fi
+          done
